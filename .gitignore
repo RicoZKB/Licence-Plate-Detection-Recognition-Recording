@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.pyd
+
+# Virtualenvs
+.venv/
+venv/
+env/
+cenv/
+
+# Jupyter / logs
+.ipynb_checkpoints/
+*.log
+
+# OS
+.DS_Store
+
+# ML artifacts & big media
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.engine
+*.npz
+*.npy
+*.ckpt
+*.weights
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.mp4
+*.mov
+runs/
+outputs/
+checkpoints/
+datasets/
+models/
