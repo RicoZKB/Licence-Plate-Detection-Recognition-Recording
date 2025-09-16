@@ -1,5 +1,6 @@
 ultralytics
 paddleocr
+yt-dlp
 #pip install paddlepaddle --index-url https://pypi.org/simple
 # CPU (no GPU)
 #pip install paddlepaddle -i https://pypi.tuna.tsinghua.edu.cn/simple

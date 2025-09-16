@@ -1,0 +1,5 @@
+timestamp,object_id,vehicle_type,direction,region_class,suffix,kana,city
+2025-09-10 08:39:03,01(82-26),car,in,,82-26,,
+2025-09-10 08:40:29,01,car,in,,,,
+2025-09-10 08:41:44,01(70-50),car,in,,70-50,,
+2025-09-10 08:43:17,01,car,in,世田谷70,,ふ,世田谷
