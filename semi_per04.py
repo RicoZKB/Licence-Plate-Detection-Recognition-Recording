@@ -1,0 +1,871 @@
+# -*- coding: utf-8 -*-
+# semi_per03.py — Camera-tough JP plates with kana:
+# - macOS camera (AVFoundation) at 1280x720 (+ MJPG ask)
+# - Super-res plate crops + multi-prep second-pass OCR (PaddleOCR 'japan')
+# - Kana-biased temporal voting
+# - Gate/ROI one-shot capture, CSV + terminal logs
+#
+# CSV columns (as requested):
+# timestamp, object_id, vehicle_type, direction, city, engine_size, kana, four-digit number
+#
+# Run:
+#   python semi_per03.py
+#
+# Choose source in the "Source selection" block below.
+
+import os, cv2, csv, re, time, math
+import numpy as np
+from datetime import datetime
+from paddleocr import PaddleOCR
+
+# If your class is in detections.py, switch accordingly:
+# from detections import LicencePlateDetection
+from licence_plate_detection import LicencePlateDetection
+
+# ===================== Source selection (choose exactly one) =====================
+USE_CAMERA               = False
+USE_FILE                 = True
+USE_YOUTUBE              = False
+
+INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
+
+YOUTUBE_URL              = "https://www.youtube.com/watch?v=jqtsC5BYlIk"
+YOUTUBE_MAX_HEIGHT       = 480
+# ===============================================================================
+
+# ---- Camera preferences (macOS) ----
+CAMERA_DEVICE_INDEX      = 0
+CAMERA_WIDTH             = 1280
+CAMERA_HEIGHT            = 720
+CAMERA_BACKEND           = cv2.CAP_AVFOUNDATION  # macOS backend
+CAMERA_FOURCC_MJPG       = True                  # ask for MJPG
+
+# Terminal & drawing
+PRINT_EVENTS_TO_TERMINAL = True
+PRINT_RAW_OCR_FOUND      = False
+SHOW_FPS                 = True
+DRAW_BBOXES              = True
+BOX_THICK                = 2
+
+# Slots & IDs
+SLOT_COUNT               = 10
+START_ID_AT              = 100
+
+# ROI / Gate (defaults; press 'm' / 'o' to toggle during runtime)
+USE_ROI_DEFAULT          = False
+REGION_XYWH_RATIO        = (0.32, 0.60, 0.36, 0.20)
+LOCK_ROI                 = False
+ENTRY_LINE_X_RATIO       = 0.55
+GATE_CAPTURE_MARGIN_PX   = 60
+DRAW_GATE                = True
+GATE_INSIDE_IS_RIGHT_DEFAULT = True
+
+# One-shot capture & debounce
+ENTER_STABLE_FRAMES      = 1
+EXIT_STABLE_FRAMES       = 4
+MIN_EVENT_GAP_FRAMES     = 10
+CAPTURE_WINDOW_FRAMES    = 6
+INSIDE_PROCESS_EVERY_N   = 8
+DETECT_EVERY_N           = 1
+
+# Suffix & sharpness
+PLATE_SUFFIX_RE          = re.compile(r"(\d{2,3})\s*[-−–—ーｰ~〜－]\s*(\d{2})")
+MIN_SHARPNESS_LOCK       = 60.0
+
+# Detector scaling
+TARGET_WIDTH             = 640
+ROI_INFER_MAX_W          = 640
+GATE_DET_BAND_RATIO      = 0.50
+
+# Output
+WRITE_VIDEO              = False
+
+# ===== Second-pass OCR (kana boost) settings =====
+KANA_RE                  = re.compile(u"[ぁ-ゖァ-ヿ]")
+UPSCALE_FACTOR           = 2.5         # super-res factor
+BILATERAL_D              = 7           # bilateral filter strength
+UNSHARP_SIGMA            = 1.0         # unsharp mask sigma
+MIN_PLATE_MIN_SIDE       = 18          # skip tiny crops
+MIN_PLATE_SHARPNESS      = 20.0        # skip too blurry crops
+
+cv2.setUseOptimized(True)
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("FLAGS_minloglevel", "2")
+
+# ---------------- YouTube resolver ----------------
+def _resolve_youtube_opencv_url(url: str, max_height: int = 480) -> str:
+    try:
+        import yt_dlp
+    except Exception:
+        print("[WARN] yt-dlp not installed. `pip install yt-dlp` to use YouTube input.")
+        return None
+    fmt = f"best[acodec!=none][vcodec!=none][ext=mp4][height<={max_height}]/best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]"
+    ydl_opts = {'quiet': True, 'no_warnings': True, 'format': fmt, 'noplaylist': True}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if 'url' in info:
+                return info['url']
+            fmt_id = info.get('format_id'); fmts = info.get('formats') or []
+            for f in fmts:
+                if f.get('format_id') == fmt_id and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
+                    return f.get('url')
+            for f in fmts:
+                if (f.get('acodec') != 'none' and f.get('vcodec') != 'none' and str(f.get('protocol','')).startswith('http')):
+                    return f.get('url')
+    except Exception as e:
+        print('[WARN] yt-dlp extraction failed:', e)
+    return None
+
+# ---------------- Text helpers ----------------
+CITY_KANA_RE = re.compile(u"^\\s*([^\\s\\d]+)\\s*[0-9]{2,4}.*?([ぁ-ゖァ-ヿA-Za-z])", re.UNICODE)
+REGION_CITY_CLASS_RE = re.compile(u"([ぁ-ゖァ-ヿ一-龯A-Za-z]+)\\s*([0-9]{2,4})", re.UNICODE)
+
+def parse_city_kana(text):
+    if not text: return None, None
+    m = CITY_KANA_RE.search(text);  return (m.group(1), m.group(2)) if m else (None, None)
+
+def normalize_ocr_text(text: str) -> str:
+    if not text: return ""
+    fw_digits = "０１２３４５６７８９"; ascii_digits = "0123456789"
+    trans = str.maketrans({fw: ascii for fw, ascii in zip(fw_digits, ascii_digits)})
+    t = text.translate(trans)
+    t = re.sub(r"[−–—ーｰ~〜－]", "-", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def plate_suffix(text):
+    if not text: return None
+    t = normalize_ocr_text(text); m = PLATE_SUFFIX_RE.search(t)
+    if not m: return None
+    return f"{m.group(1)}-{m.group(2)}"
+
+def plate_key(text):
+    t = normalize_ocr_text(text or "")
+    suf = plate_suffix(t);  city, _ = parse_city_kana(t)
+    if not suf: return None
+    return f"{city if city else '?'}|{suf}"
+
+def parse_plate_fields_v2(text):
+    """
+    Return: (city, engine_size, kana, four_digit_number)
+
+    - city:      e.g. "神戸", "大阪", "千葉"
+    - engine:    class number like "355", "531", "800"  (2–4 digits on JP plates)
+    - kana:      last kana char found (e.g. "わ", "ふ")
+    - four:      four-digit number with hyphen normalized, e.g. "70-50", "12-12", "89-56"
+    """
+    if not text:
+        return None, None, None, None
+    t = normalize_ocr_text(text)
+    four = plate_suffix(t)
+    city, engine = None, None
+    m = REGION_CITY_CLASS_RE.search(t)
+    if m:
+        city = m.group(1)
+        engine = m.group(2)
+    kana = None
+    kana_matches = re.findall(u"[ぁ-ゖァ-ヿ]", t)
+    if kana_matches:
+        kana = kana_matches[-1]
+    return city, engine, kana, four
+
+def open_daily_csv():
+    date_str = datetime.now().strftime("%Y%m%d")
+    os.makedirs("logs", exist_ok=True)
+    path = os.path.join("logs", f"parking_log_{date_str}.csv")
+    new = not os.path.exists(path)
+    f = open(path, "a", newline="", encoding="utf-8", buffering=1)
+    w = csv.writer(f)
+    if new:
+        # match the requested column order
+        w.writerow([
+            "timestamp",
+            "object_id",
+            "vehicle_type",
+            "direction",
+            "city",
+            "engine_size",
+            "kana",
+            "four-digit number",
+        ])
+        f.flush()
+    return f, w, path
+
+def write_row_flush(w, f, row):
+    w.writerow(row); f.flush()
+    try: os.fsync(f.fileno())
+    except Exception: pass
+
+def log_terminal(event_ts, direction, object_id_csv, city, engine, kana, four, raw_text):
+    if not PRINT_EVENTS_TO_TERMINAL:
+        return
+    print(f"[{event_ts}] {direction.upper():3s}  id={object_id_csv:>2s}  city='{city or ''}' "
+          f"engine='{engine or ''}'  kana='{kana or ''}'  num='{four or ''}'  raw=\"{raw_text}\"")
+
+# ---------------- Geometry helpers ----------------
+def xyxy_from_det(det):
+    if det is None: return None
+    if isinstance(det, (list, tuple)):
+        if len(det) >= 4:
+            try:
+                return float(det[0]), float(det[1]), float(det[2]), float(det[3])
+            except Exception:
+                return None
+    if isinstance(det, dict):
+        box = det.get("bbox") or det.get("xyxy")
+        if box and len(box) >= 4:
+            try:
+                return float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            except Exception:
+                return None
+    return None
+
+def offset_det(det, ox, oy):
+    xy = xyxy_from_det(det)
+    if not xy: return det
+    x1,y1,x2,y2 = xy
+    return [x1+ox, y1+oy, x2+ox, y2+oy]
+
+def scale_det(det, sx, sy):
+    xy = xyxy_from_det(det)
+    if not xy: return det
+    x1,y1,x2,y2 = xy
+    return [x1*sx, y1*sy, x2*sx, y2*sy]
+
+def center_from_det(det):
+    xy = xyxy_from_det(det)
+    if not xy: return None, None
+    x1,y1,x2,y2 = xy
+    return (x1+x2)/2.0, (y1+y2)/2.0
+
+def bbox_area(det):
+    xy = xyxy_from_det(det)
+    if not xy: return 0.0
+    x1,y1,x2,y2 = xy
+    return max(0.0, x2-x1) * max(0.0, y2-y1)
+
+def variance_of_laplacian(img):
+    if img is None or img.size == 0: return 0.0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape)==3 else img
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+def crop_frame(frame, rx, ry, rw, rh):
+    return frame[ry:ry+rh, rx:rx+rw]
+
+# ---------------- ID / Slots ----------------
+class IDBank:
+    def __init__(self, start_at=100):
+        self._map = {}; self._next = int(start_at)
+    def get(self, key):
+        if key not in self._map:
+            self._map[key] = self._next; self._next += 1
+        return self._map[key]
+
+def stable_key(text, det):
+    xy = xyxy_from_det(det)
+    if xy is None: return text if text else None
+    x1,y1,x2,y2 = xy
+    qx = int(((x1+x2)/2.0)//20); qy = int(((y1+y2)/2.0)//20)
+    t  = text if (text and len(text)>=3) else ""
+    return f"bb-{qx}-{qy}|{t}"
+
+class SlotPool:
+    def __init__(self, n): self.free=list(range(1,n+1)); self.used=set()
+    def acquire_lowest(self):
+        if not self.free: return None
+        s=self.free.pop(0); self.used.add(s); return s
+    def try_acquire_specific(self, s):
+        if s in self.free:
+            self.free.remove(s); self.used.add(s); return s
+        return None
+    def release(self, s):
+        if s in self.used:
+            self.used.remove(s); self.free.append(s); self.free.sort()
+
+# ---------------- Region utils ----------------
+def inside_region(cx, cy, rx, ry, rw, rh):
+    return (cx is not None) and (cy is not None) and (rx <= cx <= rx+rw) and (ry <= cy <= ry+rh)
+
+def clamp_region(rx, ry, rw, rh, W, H):
+    rx = max(0, min(rx, W-10)); ry = max(0, min(ry, H-10))
+    rw = max(20, min(rw, W-rx)); rh = max(20, min(rh, H-ry))
+    return rx, ry, rw, rh
+
+def draw_region(frame, rx, ry, rw, rh):
+    cv2.rectangle(frame, (int(rx), int(ry)), (int(rx+rw), int(ry+rh)), (0,255,255), 2)
+    cv2.putText(frame, "ROI (locked)" if LOCK_ROI else "ROI: WASD move, [ ] resize, r reset",
+        (int(rx+6), max(18, int(ry-6))), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 2, cv2.LINE_AA)
+
+def draw_lp_boxes_safe(frame, dets, texts):
+    if not DRAW_BBOXES: return frame
+    for det, text in zip(dets or [], texts or []):
+        xy = xyxy_from_det(det)
+        if not xy: continue
+        x1,y1,x2,y2 = map(int, map(round, xy))
+        h, w = frame.shape[:2]
+        x1 = max(0, min(w-1, x1)); x2 = max(0, min(w-1, x2))
+        y1 = max(0, min(h-1, y1)); y2 = max(0, min(h-1, y2))
+        if x2 <= x1 or y2 <= y1: continue
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), BOX_THICK)
+        # OpenCV font doesn't render kana reliably; terminal shows kana correctly.
+        cv2.putText(frame, str(text or ""), (x1, max(10, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2, cv2.LINE_AA)
+    return frame
+
+# ---------------- Second-pass OCR (kana boost) ----------------
+_ocr2 = None
+def get_ocr2():
+    """Create a PaddleOCR instance that works across versions (no show_log)."""
+    global _ocr2
+    if _ocr2 is None:
+        try:
+            # Newer PaddleOCR
+            _ocr2 = PaddleOCR(use_textline_orientation=True, lang='japan')
+        except TypeError:
+            # Older fallback
+            _ocr2 = PaddleOCR(use_angle_cls=True, lang='japan')
+    return _ocr2
+
+def prep_kana_variants(bgr):
+    if bgr is None or bgr.size == 0:
+        return []
+    # upscale
+    h, w = bgr.shape[:2]
+    up = cv2.resize(bgr, (int(w*UPSCALE_FACTOR), int(h*UPSCALE_FACTOR)), interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        g1 = clahe.apply(gray)
+    except Exception:
+        g1 = gray.copy()
+
+    # bilateral
+    try:
+        g2 = cv2.bilateralFilter(g1, d=BILATERAL_D, sigmaColor=50, sigmaSpace=50)
+    except Exception:
+        g2 = g1
+
+    # unsharp
+    blur  = cv2.GaussianBlur(g2, (0, 0), UNSHARP_SIGMA)
+    sharp = cv2.addWeighted(g2, 1.6, blur, -0.6, 0)
+
+    # gamma normalize mean to ~160
+    mean = float(np.mean(sharp))
+    gamma = 1.0
+    if mean > 1.0:
+        target = 160.0
+        gamma = max(0.6, min(1.6, math.log(target, max(mean, 1.001))))
+    look = np.array([((i/255.0)**(1.0/gamma))*255 for i in range(256)]).astype("uint8")
+    sharp = cv2.LUT(sharp, look)
+
+    # thresholds
+    thr_otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
+    thr_mean = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 21, 10)
+    thr_gaus = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8)
+
+    # invert variants
+    inv_otsu = cv2.bitwise_not(thr_otsu)
+    inv_mean = cv2.bitwise_not(thr_mean)
+    inv_gaus = cv2.bitwise_not(thr_gaus)
+
+    # morphology
+    kernel = np.ones((2,2), np.uint8)
+    mor_otsu = cv2.morphologyEx(thr_otsu, cv2.MORPH_CLOSE, kernel, iterations=1)
+    mor_gaus = cv2.morphologyEx(thr_gaus, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    def BGR(x): return cv2.cvtColor(x, cv2.COLOR_GRAY2BGR)
+
+    variants = [
+        cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR),
+        BGR(thr_otsu), BGR(thr_mean), BGR(thr_gaus),
+        BGR(inv_otsu), BGR(inv_mean), BGR(inv_gaus),
+        BGR(mor_otsu), BGR(mor_gaus),
+    ]
+    return variants
+
+def run_ocr_candidates(bgr):
+    ocr = get_ocr2()
+    best_txt = ""
+    best_score = -1
+    variants = prep_kana_variants(bgr)
+    for img in variants:
+        try:
+            res = ocr.ocr(img)
+        except Exception:
+            continue
+
+        # Pull lines across Paddle formats
+        lines = []
+        if isinstance(res, list) and len(res) >= 1 and isinstance(res[0], dict) and ("rec_texts" in res[0] or "text" in res[0]):
+            entry = res[0]
+            rec_texts = entry.get("rec_texts")
+            if isinstance(rec_texts, list) and rec_texts:
+                for txt in rec_texts:
+                    if txt: lines.append(str(txt))
+            else:
+                single = entry.get("rec_text") or entry.get("text") or ""
+                if single: lines.append(str(single))
+        else:
+            for entry in res:
+                if isinstance(entry, (list, tuple)) and len(entry) == 3 and isinstance(entry[1], str):
+                    txt = entry[1]
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[1], (list, tuple)):
+                    txt = entry[1][0]
+                elif isinstance(entry, dict):
+                    recs = entry.get("rec_texts") or entry.get("rec_text") or entry.get("text")
+                    if isinstance(recs, list): txt = recs[0] if recs else ""
+                    else: txt = recs or ""
+                else:
+                    txt = ""
+                if txt: lines.append(str(txt))
+
+        merged = normalize_ocr_text(" ".join(lines).strip())
+        if not merged: continue
+
+        # Score: kana count + valid suffix bonus + length
+        kana_cnt = len(KANA_RE.findall(merged))
+        suffix_ok = 1 if plate_suffix(merged) else 0
+        score = 3*kana_cnt + 5*suffix_ok + min(len(merged), 18)
+        if score > best_score:
+            best_score = score
+            best_txt = merged
+
+    return best_txt
+
+# ---------------- main ----------------
+def main():
+    # Source check
+    chosen = [name for name, val in [("Camera", USE_CAMERA), ("YouTube", USE_YOUTUBE), ("File", USE_FILE)] if val]
+    if len(chosen) != 1:
+        raise RuntimeError("Exactly one of USE_CAMERA, USE_YOUTUBE, USE_FILE must be True.")
+    source_name = chosen[0]
+
+    # Open source
+    if source_name == "Camera":
+        print("[INFO] Opening camera with AVFoundation (macOS) at 1280x720...")
+        cap = cv2.VideoCapture(CAMERA_DEVICE_INDEX, CAMERA_BACKEND)
+        if CAMERA_FOURCC_MJPG:
+            try:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            except Exception:
+                pass
+        try: cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        except: pass
+        try: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        except: pass
+    elif source_name == "YouTube":
+        print("[INFO] Resolving YouTube URL...", YOUTUBE_URL)
+        src = _resolve_youtube_opencv_url(YOUTUBE_URL, max_height=YOUTUBE_MAX_HEIGHT)
+        if not src: raise RuntimeError("Failed to resolve YouTube stream.")
+        cap = cv2.VideoCapture(src)
+    else:
+        if not os.path.exists(INPUT_VIDEO_PATH): raise RuntimeError(f"Input file not found: {INPUT_VIDEO_PATH}")
+        cap = cv2.VideoCapture(INPUT_VIDEO_PATH)
+
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video source.")
+
+    using_camera = (source_name == "Camera")
+    if using_camera:
+        try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except: pass
+
+    try: cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_WIDTH)  # detector logical width
+    except: pass
+
+    lp_det  = LicencePlateDetection(model_path="models/best.pt", verbose=False, debug_ocr=False)
+
+    os.makedirs("output_videos", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or TARGET_WIDTH)
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or int(TARGET_WIDTH*3/5))
+    out = cv2.VideoWriter("output_videos/output_video.avi", fourcc, fps, (W, H)) if WRITE_VIDEO else None
+
+    csv_file, csv_writer, csv_path = open_daily_csv()
+    print("[INFO] Logging to:", csv_path)
+
+    # Runtime flags (LOCAL, no globals!)
+    use_roi    = USE_ROI_DEFAULT
+    gate_right = GATE_INSIDE_IS_RIGHT_DEFAULT
+
+    # ROI init
+    if use_roi:
+        rx = int(REGION_XYWH_RATIO[0]*W); ry = int(REGION_XYWH_RATIO[1]*H)
+        rw = int(REGION_XYWH_RATIO[2]*W); rh = int(REGION_XYWH_RATIO[3]*H)
+        rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
+    else:
+        rx, ry, rw, rh = 0, 0, W, H
+
+    idbank = IDBank(START_ID_AT)
+    prev_inside = {}
+    inside_count, outside_count, last_event_f = {}, {}, {}
+
+    slot_pool = SlotPool(SLOT_COUNT)
+    plate_pref_slot, active_plate_to_slot, active_id_to_plate = {}, {}, {}
+    active_suffix_to_slot = {}
+    active_id_to_slot = {}
+    active_id_to_suffix = {}
+
+    capture_open = {}
+    best_score  = {}
+    best_text   = {}
+    best_det    = {}
+    ocr_counts  = {}
+    captured_in = set()
+
+    frame_idx = 0
+    t0 = time.time(); fcount = 0; fps_est = 0.0
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok: break
+            frame_idx += 1; fcount += 1
+
+            # Keep freshest frames on camera
+            if using_camera:
+                try:
+                    for _ in range(2): cap.grab()
+                except Exception:
+                    pass
+
+            rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
+
+            have_locked_inside = any((oid in captured_in) and prev_inside.get(oid, False) for oid in prev_inside.keys())
+            do_heavy_this_frame = True
+            if have_locked_inside and (frame_idx % INSIDE_PROCESS_EVERY_N != 0):
+                do_heavy_this_frame = False
+            if frame_idx % DETECT_EVERY_N != 0:
+                do_heavy_this_frame = False
+
+            lp_dets_full, lp_texts = [], []
+
+            if do_heavy_this_frame:
+                gate_x = int(ENTRY_LINE_X_RATIO * W)
+                if use_roi:
+                    d_rx, d_ry, d_rw, d_rh = rx, ry, rw, rh
+                else:
+                    band_w = max(160, int(W * GATE_DET_BAND_RATIO))
+                    d_rx = max(0, min(W-20, gate_x - band_w//2)); d_ry = 0
+                    d_rw = min(band_w, W - d_rx);                d_rh = H
+                det_roi = crop_frame(frame, d_rx, d_ry, d_rw, d_rh)
+
+                # downscale ROI for detector speed
+                inf_roi = det_roi
+                scale = 1.0
+                if det_roi.shape[1] > ROI_INFER_MAX_W:
+                    scale = ROI_INFER_MAX_W / float(det_roi.shape[1])
+                    new_w = int(det_roi.shape[1] * scale); new_h = int(det_roi.shape[0] * scale)
+                    inf_roi = cv2.resize(det_roi, (new_w, new_h))
+
+                all_lp_dets, all_lp_texts = lp_det.detect_frames([inf_roi])
+                roi_dets = all_lp_dets[0]; lp_texts = all_lp_texts[0]
+
+                # map back to full frame
+                lp_dets_full = []
+                if scale != 1.0:
+                    inv_sx = 1.0/scale; inv_sy = 1.0/scale
+                    for d in roi_dets:
+                        d_scaled = scale_det(d, inv_sx, inv_sy)
+                        lp_dets_full.append(offset_det(d_scaled, d_rx, d_ry))
+                else:
+                    for d in roi_dets:
+                        lp_dets_full.append(offset_det(d, d_rx, d_ry))
+            else:
+                lp_dets_full, lp_texts = [], []
+
+            # Draw boxes & raw OCR
+            if DRAW_BBOXES:
+                frame = draw_lp_boxes_safe(frame, lp_dets_full, lp_texts)
+                if use_roi:
+                    draw_region(frame, rx, ry, rw, rh)
+                elif DRAW_GATE:
+                    gx = int(ENTRY_LINE_X_RATIO * W)
+                    cv2.line(frame, (gx, 0), (gx, H), (200, 200, 255), 2)
+                    cv2.putText(frame, "gate", (gx+6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,255), 2, cv2.LINE_AA)
+
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            gate_x = int(ENTRY_LINE_X_RATIO * W)
+
+            if do_heavy_this_frame:
+                for det, text in zip(lp_dets_full, lp_texts):
+                    key = stable_key(text, det)
+                    if key is None: continue
+                    oid = idbank.get(key)
+
+                    cx, cy = center_from_det(det)
+                    if use_roi:
+                        is_in = inside_region(cx, cy, rx, ry, rw, rh)
+                    else:
+                        is_in = (cx is not None) and ((cx >= gate_x) if gate_right else (cx <= gate_x))
+
+                    if PRINT_RAW_OCR_FOUND:
+                        norm = normalize_ocr_text(text or "")
+                        if norm and (KANA_RE.search(norm) or plate_suffix(norm)):
+                            print(f"[RAW] text='{norm}'  center=({cx},{cy})")
+
+                    if oid not in prev_inside:
+                        prev_inside[oid] = is_in
+                        inside_count[oid]  = 1 if is_in else 0
+                        outside_count[oid] = 0 if is_in else 1
+                        if is_in:
+                            capture_open[oid] = CAPTURE_WINDOW_FRAMES
+                            best_score[oid] = 0.0; best_text[oid] = ""; best_det[oid] = det
+                            ocr_counts[oid] = {}
+                        continue
+
+                    if is_in:
+                        inside_count[oid]  = inside_count.get(oid,0) + 1
+                        outside_count[oid] = 0
+                    else:
+                        outside_count[oid] = outside_count.get(oid,0) + 1
+                        inside_count[oid]  = 0
+
+                    if capture_open.get(oid, 0) == -1:
+                        prev_inside[oid] = is_in
+                        continue
+
+                    # (Gate) open window on crossing/approach
+                    if (not use_roi) and (not prev_inside[oid]) and is_in:
+                        capture_open[oid] = CAPTURE_WINDOW_FRAMES
+                        best_score[oid] = 0.0; best_text[oid] = ""; best_det[oid] = det
+                        ocr_counts[oid] = {}
+                    if (not use_roi) and (oid not in captured_in) and (capture_open.get(oid, 0) <= 0):
+                        if cx is not None and abs(cx - gate_x) <= GATE_CAPTURE_MARGIN_PX:
+                            approaching_from_outside = (cx < gate_x) if gate_right else (cx > gate_x)
+                            if approaching_from_outside:
+                                capture_open[oid] = CAPTURE_WINDOW_FRAMES
+                                best_score[oid] = 0.0; best_text[oid] = ""; best_det[oid] = det
+                                ocr_counts[oid] = {}
+
+                    # ---- One-shot capture maintenance (with kana second-pass) ----
+                    if is_in and (oid not in captured_in):
+                        if capture_open.get(oid, 0) > 0:
+                            xy = xyxy_from_det(det)
+                            if xy:
+                                x1,y1,x2,y2 = map(int, map(round, xy))
+                                x1 = max(0, min(W-1, x1)); x2 = max(0, min(W-1, x2))
+                                y1 = max(0, min(H-1, y1)); y2 = max(0, min(H-1, y2))
+                                if x2 > x1 and y2 > y1:
+                                    plate_img = frame[y1:y2, x1:x2]
+                                    min_side = min(y2-y1, x2-x1)
+                                    if min_side >= MIN_PLATE_MIN_SIDE:
+                                        sharp = variance_of_laplacian(plate_img)
+                                        if sharp >= MIN_PLATE_SHARPNESS:
+                                            # (A) Detector's text
+                                            normA = normalize_ocr_text(text or "")
+                                            # (B) Second-pass OCR on enhanced variants
+                                            normB = run_ocr_candidates(plate_img)
+
+                                            # Vote both; kana & suffix bonuses
+                                            for norm in (normA, normB):
+                                                if not norm: continue
+                                                dmap = ocr_counts.setdefault(oid, {})
+                                                bonus = 0
+                                                if KANA_RE.search(norm): bonus += 2
+                                                if plate_suffix(norm):   bonus += 3
+                                                dmap[norm] = dmap.get(norm, 0) + 1 + bonus
+                                                cur_best = best_text.get(oid, "")
+                                                cur_cnt  = dmap.get(cur_best, -1)
+                                                if dmap[norm] >= cur_cnt:
+                                                    best_text[oid] = norm
+
+                                            # Fallback score by area*sharpness if suffix present
+                                            score = bbox_area(det) * max(1.0, sharp)
+                                            if score > best_score.get(oid, 0.0) and plate_suffix(normA or normB or ""):
+                                                best_score[oid] = score
+                                                best_det[oid]   = det
+
+                                            # Early accept if very sharp & suffix present
+                                            if plate_suffix(normA or normB or "") and sharp >= MIN_SHARPNESS_LOCK:
+                                                capture_open[oid] = 0
+                                            else:
+                                                capture_open[oid] -= 1
+                                        else:
+                                            capture_open[oid] -= 1
+                                    else:
+                                        capture_open[oid] -= 1
+                                else:
+                                    capture_open[oid] -= 1
+                            else:
+                                capture_open[oid] -= 1
+
+                        # ---- Window close => decide and log IN ----
+                        if capture_open.get(oid, 0) == 0 and inside_count[oid] >= ENTER_STABLE_FRAMES:
+                            dmap = ocr_counts.get(oid, {}) or {}
+                            voted = ""
+                            if dmap:
+                                items = list(dmap.items())
+                                with_suffix = [(t,c) for t,c in items if plate_suffix(t)]
+                                if with_suffix:
+                                    voted = max(with_suffix, key=lambda z: z[1])[0]
+                                else:
+                                    voted = max(items, key=lambda z: z[1])[0]
+                            chosen_text = voted or best_text.get(oid,"") or (text or "")
+                            pk = plate_key(chosen_text)
+                            city, engine, kana, four = parse_plate_fields_v2(chosen_text)
+
+                            chosen_slot = None
+                            if pk and pk in active_plate_to_slot:
+                                chosen_slot = active_plate_to_slot[pk]
+                                active_id_to_plate[oid] = pk
+                                active_id_to_slot[oid] = chosen_slot
+                                if four: active_id_to_suffix[oid] = four
+                                captured_in.add(oid); last_event_f[oid] = frame_idx; capture_open[oid] = -1
+                                # overlay keeps suffix for clarity
+                                overlay_id = f"{chosen_slot:02d}({four})" if four else f"{chosen_slot:02d}"
+                                cv2.putText(frame, f"IN {overlay_id}", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,180,255), 2, cv2.LINE_AA)
+                                # CSV uses just slot number
+                                object_id_csv = f"{chosen_slot:02d}"
+                                log_terminal(ts, "in", object_id_csv, city, engine, kana, four, chosen_text)
+                                prev_inside[oid] = is_in
+                                continue
+
+                            if four and four in active_suffix_to_slot:
+                                chosen_slot = active_suffix_to_slot[four]
+                                if pk:
+                                    active_plate_to_slot[pk] = chosen_slot
+                                    plate_pref_slot[pk] = chosen_slot
+                                    active_id_to_plate[oid] = pk
+                                active_id_to_slot[oid] = chosen_slot
+                                active_id_to_suffix[oid] = four
+                                captured_in.add(oid); last_event_f[oid] = frame_idx; capture_open[oid] = -1
+                                overlay_id = f"{chosen_slot:02d}({four})" if four else f"{chosen_slot:02d}"
+                                cv2.putText(frame, f"IN {overlay_id}", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,180,255), 2, cv2.LINE_AA)
+                                object_id_csv = f"{chosen_slot:02d}"
+                                log_terminal(ts, "in", object_id_csv, city, engine, kana, four, chosen_text)
+                                prev_inside[oid] = is_in
+                                continue
+
+                            if pk and pk in plate_pref_slot:
+                                got = slot_pool.try_acquire_specific(plate_pref_slot[pk])
+                                if got is not None: chosen_slot = got
+                            if chosen_slot is None:
+                                chosen_slot = slot_pool.acquire_lowest()
+
+                            if chosen_slot is not None:
+                                if pk:
+                                    active_plate_to_slot[pk] = chosen_slot
+                                    plate_pref_slot[pk] = chosen_slot
+                                    active_id_to_plate[oid] = pk
+                                else:
+                                    active_id_to_plate[oid] = None
+                                active_id_to_slot[oid] = chosen_slot
+                                if four:
+                                    active_suffix_to_slot[four] = chosen_slot
+                                    active_id_to_suffix[oid] = four
+
+                                # overlay keeps suffix
+                                overlay_id = f"{chosen_slot:02d}({four})" if four else f"{chosen_slot:02d}"
+                                cv2.putText(frame, f"IN {overlay_id}", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2, cv2.LINE_AA)
+
+                                # CSV uses just slot number
+                                object_id_csv = f"{chosen_slot:02d}"
+                                write_row_flush(
+                                    csv_writer, csv_file,
+                                    [ts, object_id_csv, "car", "in", city or "", engine or "", kana or "", four or ""]
+                                )
+                                captured_in.add(oid); last_event_f[oid] = frame_idx; capture_open[oid] = -1
+                                log_terminal(ts, "in", object_id_csv, city, engine, kana, four, chosen_text)
+
+                    # ---- EXIT handling ----
+                    if prev_inside[oid] and (not is_in) and outside_count[oid] >= EXIT_STABLE_FRAMES:
+                        if frame_idx - last_event_f.get(oid, -10**9) >= MIN_EVENT_GAP_FRAMES:
+                            pk_now = active_id_to_plate.get(oid)
+                            slot_to_free = None
+                            if pk_now and pk_now in active_plate_to_slot:
+                                slot_to_free = active_plate_to_slot.pop(pk_now, None)
+                            if slot_to_free is None:
+                                slot_to_free = active_id_to_slot.pop(oid, None)
+
+                            if slot_to_free is not None:
+                                chosen_text = best_text.get(oid,"") or text or ""
+                                city, engine, kana, four = parse_plate_fields_v2(chosen_text)
+
+                                # overlay may show suffix
+                                overlay_id = f"{slot_to_free:02d}({four})" if four else f"{slot_to_free:02d}"
+                                cv2.putText(frame, f"OUT {overlay_id}", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+
+                                # CSV: only the slot number
+                                object_id_csv = f"{slot_to_free:02d}"
+                                write_row_flush(
+                                    csv_writer, csv_file,
+                                    [ts, object_id_csv, "car", "out", city or "", engine or "", kana or "", four or ""]
+                                )
+                                slot_pool.release(slot_to_free)
+                                last_event_f[oid] = frame_idx
+                                log_terminal(ts, "out", object_id_csv, city, engine, kana, four, chosen_text)
+                                if four and active_suffix_to_slot.get(four) == slot_to_free:
+                                    active_suffix_to_slot.pop(four, None)
+
+                            active_id_to_plate.pop(oid, None)
+                            active_id_to_suffix.pop(oid, None)
+                            for dct in (capture_open, best_score, best_text, best_det, ocr_counts):
+                                dct.pop(oid, None)
+                            if oid in captured_in: captured_in.remove(oid)
+
+                    prev_inside[oid] = is_in
+
+            # FPS overlay
+            if SHOW_FPS:
+                now = time.time()
+                if now - t0 >= 0.5:
+                    fps_est = fcount / (now - t0); t0 = now; fcount = 0
+                tag = "" if do_heavy_this_frame else "  (throttle)"
+                cv2.putText(frame, f"FPS ~ {fps_est:.1f}{tag}", (10, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+                mode = "ROI" if use_roi else "Gate"
+                side = "Right" if gate_right else "Left"
+                cv2.putText(frame, f"Mode:{mode} Inside:{side}  [m]mode [o]side", (10, 48),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,255,180), 2, cv2.LINE_AA)
+
+            cv2.imshow("Parking (semi_per03 kana+camera)", frame)
+            if out is not None and WRITE_VIDEO: out.write(frame)
+
+            # Keys (LOCAL toggles; no globals)
+            k = cv2.waitKey(1) & 0xFF
+            if k == 27: break
+            if k == ord('m'):
+                use_roi = not use_roi
+                if use_roi:
+                    rx = int(REGION_XYWH_RATIO[0]*W); ry = int(REGION_XYWH_RATIO[1]*H)
+                    rw = int(REGION_XYWH_RATIO[2]*W); rh = int(REGION_XYWH_RATIO[3]*H)
+                    rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
+                else:
+                    rx, ry, rw, rh = 0, 0, W, H
+            if k == ord('o'):
+                gate_right = not gate_right
+            if use_roi and (not LOCK_ROI):
+                step = 12
+                if k == ord('w'): ry -= step
+                elif k == ord('s'): ry += step
+                elif k == ord('a'): rx -= step
+                elif k == ord('d'): rx += step
+                elif k == ord('['): rx += step; ry += step; rw -= 2*step; rh -= 2*step
+                elif k == ord(']'): rx -= step; ry -= step; rw += 2*step; rh += 2*step
+                elif k == ord('r'):
+                    rx = int(REGION_XYWH_RATIO[0]*W); ry = int(REGION_XYWH_RATIO[1]*H)
+                    rw = int(REGION_XYWH_RATIO[2]*W); rh = int(REGION_XYWH_RATIO[3]*H)
+                rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
+
+    finally:
+        try: cap.release()
+        except: pass
+        try:
+            if WRITE_VIDEO and out is not None: out.release()
+        except: pass
+        cv2.destroyAllWindows()
+        csv_file.close()
+        print("[INFO] CSV saved to", csv_path)
+        if WRITE_VIDEO: print("[INFO] Video saved to output_videos/output_video.avi")
+
+if __name__ == "__main__":
+    main()
