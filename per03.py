@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
-# segion08.py — ROI-cropped, one-shot plate capture + throttled OCR while inside
-# - Runs detector/OCR only INSIDE the yellow ROI (cropped inference = faster)
-# - Logs once on ENTER as soon as a "good" frame appears (sharp + valid suffix)
-# - Skips further OCR for that object until EXIT (lightweight while inside)
+# semi_per01.py — ROI/Gate one-shot capture (fast baseline) + optional YouTube input
+# - Cropped plate detection (ROI or Gate band) for speed
+# - One-shot OCR on ENTER (best sharpness + valid suffix), then throttle while inside
 # - Immediate CSV flush on every write
+# - Source selector: Camera / File / YouTube (choose exactly one)
 
 import os, cv2, csv, re, time
 from datetime import datetime
-from detections import CarDetection, LicencePlateDetection
+# Use local detector module
+from licence_plate_detection import LicencePlateDetection
 
 # ===================== User settings =====================
+# Choose exactly ONE of these:
 USE_CAMERA               = False
 USE_FILE                 = True
+USE_YOUTUBE              = False
+
+# File source
 INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
 
 # YouTube source (VOD or livestream). If enabled, overrides camera/file.
-USE_YOUTUBE              = False
 YOUTUBE_URL              = "https://www.youtube.com/watch?v=jqtsC5BYlIk"
-YOUTUBE_MAX_HEIGHT       = 480   # pick a progressive stream at or below this height
+YOUTUBE_MAX_HEIGHT       = 480   # pick a progressive MP4 stream at or below this height
 
 SLOT_COUNT               = 10
 START_ID_AT              = 100
@@ -33,7 +37,7 @@ USE_ROI                  = False
 ENTRY_LINE_X_RATIO       = 0.55   # vertical line as fraction of width
 GATE_CAPTURE_MARGIN_PX   = 60     # start capture window when within this many px of gate
 DRAW_GATE                = True
-GATE_INSIDE_IS_RIGHT     = False   # True: right of line means "inside"; False: left is inside
+GATE_INSIDE_IS_RIGHT     = True   # True: right of line means "inside"; False: left is inside
 
 # Stability & gaps
 ENTER_STABLE_FRAMES      = 1     # we lock early anyway
@@ -53,12 +57,11 @@ PLATE_SUFFIX_RE          = re.compile(r"(\d{2,3})\s*[-−–—ーｰ~〜－]\s*
 MIN_SHARPNESS_LOCK       = 60.0   # Laplacian variance to accept immediately
 
 # Performance toggles
-USE_CAR_DETECTOR         = False  # more load if True
-WRITE_VIDEO              = True
+WRITE_VIDEO              = False
 DRAW_BBOXES              = True
 SHOW_FPS                 = True
 TARGET_WIDTH             = 640    # small input for speed
-BOX_THICK                = 3      # thin overlays
+BOX_THICK                = 1      # thin overlays
 # If ROI is wider than this, downscale before detection for speed
 ROI_INFER_MAX_W          = 640
 GATE_DET_BAND_RATIO      = 0.50  # width of detection band around gate (0..1 of W)
@@ -71,38 +74,25 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 os.environ.setdefault("FLAGS_minloglevel", "2")
 
 def _resolve_youtube_opencv_url(url: str, max_height: int = 480) -> str:
-    """Return a direct progressive HTTP URL suitable for OpenCV from a YouTube link.
-    Requires yt_dlp to be installed. Returns None on failure.
-    """
+    """Return a direct MP4 HTTP URL for OpenCV VideoCapture using yt-dlp."""
     try:
         import yt_dlp
-    except Exception as e:
-        print("[WARN] yt-dlp not installed. pip install yt-dlp to use YouTube input.")
+    except Exception:
+        print("[WARN] yt-dlp not installed. `pip install yt-dlp` to use YouTube input.")
         return None
-
-    # prefer progressive (audio+video) MP4/H264 at or below max_height
     fmt = f"best[acodec!=none][vcodec!=none][ext=mp4][height<={max_height}]/best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]"
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': fmt,
-        'noplaylist': True,
-    }
+    ydl_opts = {'quiet': True, 'no_warnings': True, 'format': fmt, 'noplaylist': True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if 'url' in info:
                 return info['url']
-            # sometimes selected format lives in 'formats'
-            fmt_id = info.get('format_id')
-            fmts = info.get('formats') or []
+            fmt_id = info.get('format_id'); fmts = info.get('formats') or []
             for f in fmts:
                 if f.get('format_id') == fmt_id and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
                     return f.get('url')
-            # fallback: find first progressive http(s)
             for f in fmts:
-                if (f.get('acodec') != 'none' and f.get('vcodec') != 'none' and
-                    (f.get('protocol','').startswith('http'))):
+                if (f.get('acodec') != 'none' and f.get('vcodec') != 'none' and str(f.get('protocol','')).startswith('http')):
                     return f.get('url')
     except Exception as e:
         print('[WARN] yt-dlp extraction failed:', e)
@@ -159,10 +149,8 @@ def parse_plate_fields(text):
     """
     if not text:
         return None, None, None, None
-    # suffix
     t = normalize_ocr_text(text)
     suf = plate_suffix(t)
-    # region + class
     city = None; region_class = None
     m = REGION_WITH_NUM_RE.search(t)
     if m:
@@ -306,29 +294,28 @@ def draw_lp_boxes(frame, dets, color=(0,255,0)):
 
 # ---------- main ----------
 def main():
-    # runtime flags (toggled by keyboard)
-    use_roi = USE_ROI
-    gate_right = GATE_INSIDE_IS_RIGHT
-
-    # Choose source strictly by flags (exactly one True)
+    # --- Source selection (exactly one enabled) ---
     chosen = [name for name, val in [("Camera", USE_CAMERA), ("YouTube", USE_YOUTUBE), ("File", USE_FILE)] if val]
     if len(chosen) != 1:
         raise RuntimeError("Exactly one of USE_CAMERA, USE_YOUTUBE, USE_FILE must be True.")
-
     source_name = chosen[0]
+
     if source_name == "Camera":
         src = 0
     elif source_name == "YouTube":
         print("[INFO] Resolving YouTube URL...", YOUTUBE_URL)
         src = _resolve_youtube_opencv_url(YOUTUBE_URL, max_height=YOUTUBE_MAX_HEIGHT)
-        if not src:
-            raise RuntimeError("Failed to resolve YouTube stream. Check YOUTUBE_URL and yt-dlp installation.")
+        if not src: raise RuntimeError("Failed to resolve YouTube stream (yt-dlp or network issue).")
         short = (src[:80] + '...') if isinstance(src, str) and len(src) > 80 else src
         print("[INFO] Using YouTube stream:", short)
     else:
         src = INPUT_VIDEO_PATH
-        if not os.path.exists(src):
-            raise RuntimeError(f"Input file not found: {src}")
+        if not os.path.exists(src): raise RuntimeError(f"Input file not found: {src}")
+
+    # runtime flags (toggled by keyboard)
+    use_roi = USE_ROI
+    gate_right = GATE_INSIDE_IS_RIGHT
+
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source: {src}")
@@ -342,9 +329,8 @@ def main():
     try: cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_WIDTH)
     except: pass
 
-    car_det = CarDetection(model_path="yolo11n.pt") if USE_CAR_DETECTOR else None
-    # Enable concise per-detection prints only for camera runs
-    lp_det  = LicencePlateDetection(model_path="models/best.pt", verbose=using_camera, debug_ocr=False)
+    # Plate detector (verbose for cameras)
+    lp_det  = LicencePlateDetection(model_path="models/best.pt")
 
     os.makedirs("output_videos", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -391,9 +377,17 @@ def main():
             if not ok: break
             frame_idx += 1; fcount += 1
 
+            # Freshest-frame bias for cameras: drop a couple queued frames
+            if using_camera:
+                try:
+                    for _ in range(2):
+                        cap.grab()
+                except Exception:
+                    pass
+
             # --- ROI bookkeeping for overlays (and optional keyboard control) ---
             rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
-            roi = crop_frame(frame, rx, ry, rw, rh)
+            # roi = crop_frame(frame, rx, ry, rw, rh)  # (not used directly below)
 
             # throttle heavy work if any captured car is still inside
             have_locked_inside = any((oid in captured_in) and prev_inside.get(oid, False) for oid in prev_inside.keys())
@@ -443,43 +437,9 @@ def main():
             else:
                 lp_dets_full, lp_texts = [], []
 
-            # Optional car boxes (also cropped for speed)
-            car_dets_full = []
-            if USE_CAR_DETECTOR and do_heavy_this_frame:
-                # keep car detector in sync with detection ROI scaling
-                gate_x = int(ENTRY_LINE_X_RATIO * W)
-                if use_roi:
-                    d_rx, d_ry, d_rw, d_rh = rx, ry, rw, rh
-                else:
-                    band_w = max(160, int(W * GATE_DET_BAND_RATIO))
-                    d_rx = max(0, min(W-20, gate_x - band_w//2))
-                    d_ry = 0
-                    d_rw = min(band_w, W - d_rx)
-                    d_rh = H
-                det_roi = crop_frame(frame, d_rx, d_ry, d_rw, d_rh)
-                inf_roi = det_roi
-                scale = 1.0
-                if det_roi.shape[1] > ROI_INFER_MAX_W:
-                    scale = ROI_INFER_MAX_W / float(det_roi.shape[1])
-                    new_w = int(det_roi.shape[1] * scale)
-                    new_h = int(det_roi.shape[0] * scale)
-                    inf_roi = cv2.resize(det_roi, (new_w, new_h))
-                car_dets = car_det.detect_frames([inf_roi], read_from_stub=False)[0]
-                if scale != 1.0:
-                    inv_sx = 1.0/scale; inv_sy = 1.0/scale
-                    for d in car_dets:
-                        d_scaled = scale_det(d, inv_sx, inv_sy)
-                        car_dets_full.append(offset_det(d_scaled, d_rx, d_ry))
-                else:
-                    for d in car_dets:
-                        car_dets_full.append(offset_det(d, d_rx, d_ry))
-
             # Draw overlays
             if DRAW_BBOXES and do_heavy_this_frame:
-                # draw our thin LP boxes (faster than calling detector drawer)
                 draw_lp_boxes(frame, lp_dets_full, color=(0,255,0))
-                if USE_CAR_DETECTOR:
-                    draw_lp_boxes(frame, car_dets_full, color=(255,200,0))
             if DRAW_BBOXES:
                 if use_roi:
                     draw_region(frame, rx, ry, rw, rh)
@@ -544,15 +504,12 @@ def main():
                         if cx is not None and abs(cx - gate_x) <= GATE_CAPTURE_MARGIN_PX:
                             # Only trigger if approaching from the outside direction
                             approaching_from_outside = (cx < gate_x) if gate_right else (cx > gate_x)
-                            if not approaching_from_outside:
-                                pass
-                            else:
+                            if approaching_from_outside:
                                 capture_open[oid] = CAPTURE_WINDOW_FRAMES
                                 best_score[oid] = 0.0; best_text[oid] = ""; best_det[oid] = det
 
                     # one-shot capture maintenance
                     if is_in and (oid not in captured_in):
-                        plate_img = None
                         # rank by area*sharpness as fallback
                         if capture_open.get(oid, 0) > 0:
                             x1,y1,x2,y2 = map(int, xyxy_from_det(det))
@@ -677,7 +634,7 @@ def main():
 
                             # always clear id->plate on exit
                             active_id_to_plate.pop(oid, None)
-                            suf_for_oid = active_id_to_suffix.pop(oid, None)
+                            active_id_to_suffix.pop(oid, None)
 
                             # clear state so future re-entry will capture again
                             for dct in (capture_open, best_score, best_text, best_det):
@@ -698,16 +655,9 @@ def main():
                 side = "Right" if gate_right else "Left"
                 cv2.putText(frame, f"Mode:{mode} Inside:{side}  [m]mode [o]side", (10, 48),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,255,180), 2, cv2.LINE_AA)
-                # Source HUD
-                try:
-                    src_name = source_name
-                except NameError:
-                    src_name = "Unknown"
-                cv2.putText(frame, f"Source:{src_name}", (10, 68),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,220,255), 2, cv2.LINE_AA)
 
             # Display / write
-            cv2.imshow("Parking (segion08 ROI one-shot)", frame)
+            cv2.imshow("Parking (semi_per01 ROI one-shot + YouTube)", frame)
             if out is not None and WRITE_VIDEO: out.write(frame)
 
             # optional ROI keyboard control if not locked (ROI mode only).

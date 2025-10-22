@@ -11,7 +11,7 @@ from detections import CarDetection, LicencePlateDetection
 
 # ===================== User settings =====================
 USE_CAMERA               = False
-INPUT_VIDEO_PATH         = "input_videos/Trim20.mp4"
+INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
 
 SLOT_COUNT               = 10
 START_ID_AT              = 100

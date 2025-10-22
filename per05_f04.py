@@ -1,101 +1,94 @@
 # -*- coding: utf-8 -*-
-# per01.py — ROI/Gate one-shot capture with camera-profile optimizations
-# - Throttled detector/OCR for wobbly FPS cameras
-# - Temporal OCR voting (stable text across shaky frames)
-# - Skips tiny/blurry crops to save CPU
-# - Fresh-frame bias (drop queued frames) for live camera
+# per5_gate_optimized.py — Gate-based license plate tracking for parking entry/exit
+# Optimized for gate-line crossing detection with visual feedback
 
 import os, cv2, csv, re, time
 from datetime import datetime
-from detections import CarDetection, LicencePlateDetection
+from licence_plate_detection import LicencePlateDetection
 
-# ===================== User settings (Camera Profile) =====================
-USE_CAMERA               = False
-USE_FILE                 = True
-INPUT_VIDEO_PATH         = "input_videos/truck.mp4"
-
-# YouTube source (VOD or livestream). If enabled, overrides camera/file.
+# ===================== GATE MODE SETTINGS =====================
+# Source selection (choose exactly one)
+USE_CAMERA               = True
+USE_FILE                 = False
 USE_YOUTUBE              = False
-YOUTUBE_URL              = "https://www.youtube.com/watch?v=jqtsC5BYlIk"
-YOUTUBE_MAX_HEIGHT       = 480   # pick a progressive stream at or below this height
 
+INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
+YOUTUBE_URL              = "https://www.youtube.com/watch?v=jqtsC5BYlIk"
+YOUTUBE_MAX_HEIGHT       = 480
+
+# Gate configuration
+GATE_MODE                = True   # True = use gate line, False = use ROI box
+ENTRY_LINE_X_RATIO       = 0.50   # Position of vertical gate line (0.0-1.0)
+GATE_INSIDE_IS_RIGHT     = True   # True = right side is inside, False = left side
+GATE_CAPTURE_MARGIN_PX   = 80     # Start capture when within this distance
+GATE_DETECTION_BAND      = 0.60   # Width of detection band around gate (0.0-1.0)
+
+# Visual feedback
+DRAW_GATE                = True   # Draw the gate line
+DRAW_DETECTION_ZONE      = True   # Draw the detection band
+GATE_LINE_COLOR          = (0, 255, 255)     # Cyan
+INSIDE_ZONE_COLOR        = (100, 255, 100)   # Light green
+OUTSIDE_ZONE_COLOR       = (255, 200, 100)   # Light blue
+DETECTION_BAND_COLOR     = (200, 150, 255)   # Light purple
+
+# Terminal logging
+PRINT_EVENTS_TO_TERMINAL = True
+PRINT_RAW_OCR_FOUND      = False
+PASS_OCR_DEBUG_TO_DETECT = False
+
+# Event detection tuning
+ENTER_STABLE_FRAMES      = 1      # Frames to confirm entry
+EXIT_STABLE_FRAMES       = 4      # Frames to confirm exit
+MIN_EVENT_GAP_FRAMES     = 10     # Minimum frames between events
+CAPTURE_WINDOW_FRAMES    = 8      # Frames to capture best plate reading
+MIN_SHARPNESS_LOCK       = 60.0   # Sharpness threshold for instant acceptance
+
+# Performance settings
+INSIDE_PROCESS_EVERY_N   = 8      # Process every N frames when car inside
+DETECT_EVERY_N           = 1      # Run detector every N frames
+TARGET_WIDTH             = 640
+ROI_INFER_MAX_W          = 640
+WRITE_VIDEO              = False
+SHOW_FPS                 = True
+BOX_THICK                = 2
+
+# Parking slots
 SLOT_COUNT               = 10
 START_ID_AT              = 100
-
-# Region as ratios of frame (x, y, w, h) — used only when USE_ROI = True
-REGION_XYWH_RATIO        = (0.32, 0.60, 0.36, 0.20)
-
-# Lock ROI from code (disable WASD/[ ])
-LOCK_ROI                 = False
-
-# Prefer a virtual gate line instead of ROI region (detect anywhere)
-USE_ROI                  = False
-ENTRY_LINE_X_RATIO       = 0.55   # vertical line as fraction of width
-GATE_CAPTURE_MARGIN_PX   = 60     # start capture window when within this many px of gate
-DRAW_GATE                = True
-GATE_INSIDE_IS_RIGHT     = False   # True: right of line means "inside"; False: left is inside
-
-# Stability & gaps (debounce on shaky streams)
-ENTER_STABLE_FRAMES      = 2
-EXIT_STABLE_FRAMES       = 6
-MIN_EVENT_GAP_FRAMES     = 10
-
-# One-shot window (fallback if sharpness never crosses threshold)
-CAPTURE_WINDOW_FRAMES    = 6
-
-# While car remains inside, only process heavy every N frames
-INSIDE_PROCESS_EVERY_N   = 6      # was 8
-DETECT_EVERY_N           = 2      # was 1
-
-# One-shot accept rules
-# Accept hyphen variants: - − – — ー ｰ ~ 〜 and optional spaces
-PLATE_SUFFIX_RE          = re.compile(r"(\d{2,3})\s*[-−–—ーｰ~〜－]\s*(\d{2})")
-MIN_SHARPNESS_LOCK       = 80.0   # was 60.0
-
-# Performance toggles
-USE_CAR_DETECTOR         = False  # more load if True
-WRITE_VIDEO              = True
-DRAW_BBOXES              = True
-SHOW_FPS                 = True
-TARGET_WIDTH             = 640
-BOX_THICK                = 3
-# If ROI is wider than this, downscale before detection for speed
-ROI_INFER_MAX_W          = 480    # was 640
-GATE_DET_BAND_RATIO      = 0.35   # was 0.50
 # =========================================================
 
-# Reduce OpenCV overhead a bit
 cv2.setUseOptimized(True)
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
-os.environ.setdefault("FLAGS_minloglevel", "2")
 
 def _resolve_youtube_opencv_url(url: str, max_height: int = 480) -> str:
+    """Return a direct MP4 HTTP URL for OpenCV VideoCapture using yt-dlp."""
     try:
         import yt_dlp
     except Exception:
-        print("[WARN] yt-dlp not installed. pip install yt-dlp to use YouTube input.")
+        print("[WARN] yt-dlp not installed. `pip install yt-dlp` to use YouTube input.")
         return None
     fmt = f"best[acodec!=none][vcodec!=none][ext=mp4][height<={max_height}]/best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]"
     ydl_opts = {'quiet': True, 'no_warnings': True, 'format': fmt, 'noplaylist': True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            if 'url' in info: return info['url']
+            if 'url' in info:
+                return info['url']
             fmt_id = info.get('format_id'); fmts = info.get('formats') or []
             for f in fmts:
                 if f.get('format_id') == fmt_id and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
                     return f.get('url')
             for f in fmts:
-                if (f.get('acodec') != 'none' and f.get('vcodec') != 'none' and (f.get('protocol','').startswith('http'))):
+                if (f.get('acodec') != 'none' and f.get('vcodec') != 'none' and str(f.get('protocol','')).startswith('http')):
                     return f.get('url')
     except Exception as e:
         print('[WARN] yt-dlp extraction failed:', e)
     return None
 
+# Japanese license plate parsing
 CITY_KANA_RE = re.compile(u"^\\s*([^\\s\\d]+)\\s*[0-9]{2,4}.*?([ぁ-ゖァ-ヿA-Za-z])", re.UNICODE)
-def parse_city_kana(text):
-    if not text: return None, None
-    m = CITY_KANA_RE.search(text);  return (m.group(1), m.group(2)) if m else (None, None)
+PLATE_SUFFIX_RE = re.compile(r"(\d{2,3})\s*[-−–—ーｰ~〜－]\s*(\d{2})")
+REGION_WITH_NUM_RE = re.compile(u"([ぁ-ゖァ-ヿ一-龯A-Za-z]+)\\s*([0-9]{2,4})", re.UNICODE)
 
 def normalize_ocr_text(text: str) -> str:
     if not text: return ""
@@ -114,22 +107,26 @@ def plate_suffix(text):
 
 def plate_key(text):
     t = normalize_ocr_text(text or "")
-    suf = plate_suffix(t);  city, _ = parse_city_kana(t)
+    suf = plate_suffix(t)
     if not suf: return None
-    return f"{city if city else '?'}|{suf}"
+    city_match = CITY_KANA_RE.search(t)
+    city = city_match.group(1) if city_match else '?'
+    return f"{city}|{suf}"
 
-REGION_WITH_NUM_RE = re.compile(u"([ぁ-ゖァ-ヿ一-龯A-Za-z]+)\\s*([0-9]{2,4})", re.UNICODE)
 def parse_plate_fields(text):
-    if not text: return None, None, None, None
+    """Returns: region_class, suffix, kana, city, engine_size"""
+    if not text: return None, None, None, None, None
     t = normalize_ocr_text(text)
     suf = plate_suffix(t)
-    city = None; region_class = None
+    city = None; region_class = None; engine_size = None
     m = REGION_WITH_NUM_RE.search(t)
     if m:
-        city = m.group(1); region_class = f"{m.group(1)}{m.group(2)}"
+        city = m.group(1)
+        engine_size = m.group(2)
+        region_class = f"{city}{engine_size}"
     kana = None; kana_matches = re.findall(u"[ぁ-ゖァ-ヿ]", t)
     if kana_matches: kana = kana_matches[-1]
-    return region_class, suf, kana, city
+    return region_class, suf, kana, city, engine_size
 
 def open_daily_csv():
     date_str = datetime.now().strftime("%Y%m%d")
@@ -139,7 +136,7 @@ def open_daily_csv():
     f = open(path, "a", newline="", encoding="utf-8", buffering=1)
     w = csv.writer(f)
     if new:
-        w.writerow(["timestamp","object_id","vehicle_type","direction","region_class","suffix","kana","city"])
+        w.writerow(["timestamp","object_id","vehicle_type","direction","city","engine_size","kana","four-digit number"])
         f.flush()
     return f, w, path
 
@@ -148,7 +145,16 @@ def write_row_flush(w, f, row):
     try: os.fsync(f.fileno())
     except Exception: pass
 
-# ---------- geometry helpers ----------
+def log_terminal(event_ts, direction, slot_str, region_class, suffix, kana, city, raw_text):
+    if not PRINT_EVENTS_TO_TERMINAL:
+        return
+    kana_disp = kana if kana else ""
+    city_disp = city if city else ""
+    rc_disp = region_class if region_class else ""
+    suf_disp = suffix if suffix else ""
+    print(f"[{event_ts}] {direction.upper():3s}  slot={slot_str:>6s}  region_class='{rc_disp}'  suffix='{suf_disp}'  kana='{kana_disp}'  city='{city_disp}'  raw=\"{raw_text}\"")
+
+# Geometry helpers
 def xyxy_from_det(det):
     if isinstance(det, (list, tuple)) and len(det) >= 4:
         return float(det[0]), float(det[1]), float(det[2]), float(det[3])
@@ -201,7 +207,7 @@ def variance_of_laplacian(img):
 def crop_frame(frame, rx, ry, rw, rh):
     return frame[ry:ry+rh, rx:rx+rw]
 
-# ---------- ID / slots ----------
+# ID and slot management
 class IDBank:
     def __init__(self, start_at=100):
         self._map = {}; self._next = int(start_at)
@@ -215,7 +221,7 @@ def stable_key(text, det):
     if xy is None: return text if text else None
     x1,y1,x2,y2 = xy
     qx = int(((x1+x2)/2.0)//20); qy = int(((y1+y2)/2.0)//20)
-    t  = text if (text and len(text)>=3) else ""
+    t = text if (text and len(text)>=3) else ""
     return f"bb-{qx}-{qy}|{t}"
 
 class SlotPool:
@@ -231,19 +237,37 @@ class SlotPool:
         if s in self.used:
             self.used.remove(s); self.free.append(s); self.free.sort()
 
-# ---------- region utils ----------
-def inside_region(cx, cy, rx, ry, rw, rh):
-    return (cx is not None) and (cy is not None) and (rx <= cx <= rx+rw) and (ry <= cy <= ry+rh)
+def draw_gate_overlay(frame, gate_x, W, H, gate_right):
+    """Draw enhanced gate visualization"""
+    # Draw gate line
+    if DRAW_GATE:
+        cv2.line(frame, (gate_x, 0), (gate_x, H), GATE_LINE_COLOR, 3)
+        label = "GATE →" if gate_right else "← GATE"
+        cv2.putText(frame, label, (gate_x + 10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, GATE_LINE_COLOR, 2, cv2.LINE_AA)
+    
+    # Draw side labels
+    if gate_right:
+        cv2.putText(frame, "OUTSIDE", (10, H - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, OUTSIDE_ZONE_COLOR, 2, cv2.LINE_AA)
+        cv2.putText(frame, "INSIDE", (gate_x + 20, H - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, INSIDE_ZONE_COLOR, 2, cv2.LINE_AA)
+    else:
+        cv2.putText(frame, "INSIDE", (10, H - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, INSIDE_ZONE_COLOR, 2, cv2.LINE_AA)
+        cv2.putText(frame, "OUTSIDE", (gate_x + 20, H - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, OUTSIDE_ZONE_COLOR, 2, cv2.LINE_AA)
 
-def clamp_region(rx, ry, rw, rh, W, H):
-    rx = max(0, min(rx, W-10)); ry = max(0, min(ry, H-10))
-    rw = max(20, min(rw, W-rx)); rh = max(20, min(rh, H-ry))
-    return rx, ry, rw, rh
-
-def draw_region(frame, rx, ry, rw, rh):
-    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0,255,255), BOX_THICK)
-    cv2.putText(frame, "ROI (locked)" if LOCK_ROI else "ROI: WASD move, [ ] resize, r reset",
-                (rx+6, max(18, ry-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 2, cv2.LINE_AA)
+def draw_detection_band(frame, gate_x, W, H, band_ratio):
+    """Draw semi-transparent detection band around gate"""
+    if not DRAW_DETECTION_ZONE:
+        return
+    band_w = int(W * band_ratio)
+    x1 = max(0, gate_x - band_w // 2)
+    x2 = min(W, gate_x + band_w // 2)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, 0), (x2, H), DETECTION_BAND_COLOR, -1)
+    cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
 
 def draw_lp_boxes(frame, dets, color=(0,255,0)):
     for d in dets:
@@ -252,11 +276,8 @@ def draw_lp_boxes(frame, dets, color=(0,255,0)):
         x1,y1,x2,y2 = map(int, xy)
         cv2.rectangle(frame, (x1,y1), (x2,y2), color, BOX_THICK)
 
-# ---------- main ----------
 def main():
-    use_roi = USE_ROI
-    gate_right = GATE_INSIDE_IS_RIGHT
-
+    # Source selection
     chosen = [name for name, val in [("Camera", USE_CAMERA), ("YouTube", USE_YOUTUBE), ("File", USE_FILE)] if val]
     if len(chosen) != 1:
         raise RuntimeError("Exactly one of USE_CAMERA, USE_YOUTUBE, USE_FILE must be True.")
@@ -268,14 +289,18 @@ def main():
         print("[INFO] Resolving YouTube URL...", YOUTUBE_URL)
         src = _resolve_youtube_opencv_url(YOUTUBE_URL, max_height=YOUTUBE_MAX_HEIGHT)
         if not src: raise RuntimeError("Failed to resolve YouTube stream.")
-        short = (src[:80] + '...') if isinstance(src, str) and len(src) > 80 else src
-        print("[INFO] Using YouTube stream:", short)
+        print("[INFO] Using YouTube stream")
     else:
         src = INPUT_VIDEO_PATH
         if not os.path.exists(src): raise RuntimeError(f"Input file not found: {src}")
 
+    # Runtime flags
+    use_gate = GATE_MODE
+    gate_right = GATE_INSIDE_IS_RIGHT
+
     cap = cv2.VideoCapture(src)
-    if not cap.isOpened(): raise RuntimeError(f"Could not open video source: {src}")
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video source: {src}")
 
     using_camera = (source_name == "Camera")
     if using_camera:
@@ -285,8 +310,10 @@ def main():
     try: cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_WIDTH)
     except: pass
 
-    car_det = CarDetection(model_path="yolo11n.pt") if USE_CAR_DETECTOR else None
-    lp_det  = LicencePlateDetection(model_path="models/best.pt", verbose=using_camera, debug_ocr=False)
+    # License plate detector
+    lp_det = LicencePlateDetection(model_path="models/best.pt",
+                                    verbose=False,
+                                    debug_ocr=PASS_OCR_DEBUG_TO_DETECT)
 
     os.makedirs("output_videos", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -297,13 +324,11 @@ def main():
 
     csv_file, csv_writer, csv_path = open_daily_csv()
     print("[INFO] Logging to:", csv_path)
-
-    if use_roi:
-        rx = int(REGION_XYWH_RATIO[0]*W); ry = int(REGION_XYWH_RATIO[1]*H)
-        rw = int(REGION_XYWH_RATIO[2]*W); rh = int(REGION_XYWH_RATIO[3]*H)
-        rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
-    else:
-        rx, ry, rw, rh = 0, 0, W, H
+    print(f"[INFO] Gate mode: {'ENABLED' if use_gate else 'DISABLED'}")
+    print(f"[INFO] Gate position: {ENTRY_LINE_X_RATIO*100:.0f}% across frame")
+    print(f"[INFO] Inside zone: {'RIGHT' if gate_right else 'LEFT'} of gate line")
+    print(f"[INFO] Detection band width: {GATE_DETECTION_BAND*100:.0f}% of frame")
+    print("[INFO] Press 'm' to toggle gate/ROI mode, 'o' to flip inside/outside, ESC to quit")
 
     idbank = IDBank(START_ID_AT)
     prev_inside = {}
@@ -315,11 +340,10 @@ def main():
     active_id_to_slot = {}
     active_id_to_suffix = {}
 
-    capture_open = {}    # oid -> frames left (0 close, -1 locked)
-    best_score  = {}     # oid -> area*sharpness (fallback ranking)
-    best_text   = {}     # oid -> best OCR so far (string)
-    best_det    = {}     # oid -> det for best
-    ocr_counts  = {}     # oid -> {normalized_text: count}  # NEW (temporal voting)
+    capture_open = {}
+    best_score = {}
+    best_text = {}
+    best_det = {}
     captured_in = set()
 
     frame_idx = 0
@@ -331,7 +355,6 @@ def main():
             if not ok: break
             frame_idx += 1; fcount += 1
 
-            # Freshest frame bias for cameras: discard queued frames quickly (super cheap)
             if using_camera:
                 try:
                     for _ in range(2):
@@ -339,11 +362,6 @@ def main():
                 except Exception:
                     pass
 
-            # --- ROI bookkeeping for overlays (and optional keyboard control) ---
-            rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
-            roi = crop_frame(frame, rx, ry, rw, rh)
-
-            # throttle heavy work if any captured car is still inside
             have_locked_inside = any((oid in captured_in) and prev_inside.get(oid, False) for oid in prev_inside.keys())
             do_heavy_this_frame = True
             if have_locked_inside and (frame_idx % INSIDE_PROCESS_EVERY_N != 0):
@@ -352,29 +370,30 @@ def main():
                 do_heavy_this_frame = False
 
             lp_dets_full, lp_texts = [], []
+            gate_x = int(ENTRY_LINE_X_RATIO * W)
 
-            if do_heavy_this_frame:
-                gate_x = int(ENTRY_LINE_X_RATIO * W)
-                if use_roi:
-                    d_rx, d_ry, d_rw, d_rh = rx, ry, rw, rh
-                else:
-                    band_w = max(160, int(W * GATE_DET_BAND_RATIO))
-                    d_rx = max(0, min(W-20, gate_x - band_w//2));  d_ry = 0
-                    d_rw = min(band_w, W - d_rx);                 d_rh = H
+            if do_heavy_this_frame and use_gate:
+                # Detection band around gate
+                band_w = max(160, int(W * GATE_DETECTION_BAND))
+                d_rx = max(0, min(W-20, gate_x - band_w//2))
+                d_ry = 0
+                d_rw = min(band_w, W - d_rx)
+                d_rh = H
                 det_roi = crop_frame(frame, d_rx, d_ry, d_rw, d_rh)
 
-                # Downscale detection ROI for speed, detect, then map back
+                # Downscale for inference
                 inf_roi = det_roi
                 scale = 1.0
                 if det_roi.shape[1] > ROI_INFER_MAX_W:
                     scale = ROI_INFER_MAX_W / float(det_roi.shape[1])
-                    new_w = int(det_roi.shape[1] * scale); new_h = int(det_roi.shape[0] * scale)
+                    new_w = int(det_roi.shape[1] * scale)
+                    new_h = int(det_roi.shape[0] * scale)
                     inf_roi = cv2.resize(det_roi, (new_w, new_h))
 
                 all_lp_dets, all_lp_texts = lp_det.detect_frames([inf_roi])
                 roi_dets = all_lp_dets[0]; lp_texts = all_lp_texts[0]
 
-                # map boxes back to full-frame coordinates
+                # Map to full frame
                 lp_dets_full = []
                 if scale != 1.0:
                     inv_sx = 1.0/scale; inv_sy = 1.0/scale
@@ -384,53 +403,18 @@ def main():
                 else:
                     for d in roi_dets:
                         lp_dets_full.append(offset_det(d, d_rx, d_ry))
-            else:
-                lp_dets_full, lp_texts = [], []
 
-            # Optional car boxes (kept aligned with same ROI/scaling)
-            car_dets_full = []
-            if USE_CAR_DETECTOR and do_heavy_this_frame:
-                gate_x = int(ENTRY_LINE_X_RATIO * W)
-                if use_roi:
-                    d_rx, d_ry, d_rw, d_rh = rx, ry, rw, rh
-                else:
-                    band_w = max(160, int(W * GATE_DET_BAND_RATIO))
-                    d_rx = max(0, min(W-20, gate_x - band_w//2)); d_ry = 0
-                    d_rw = min(band_w, W - d_rx);                d_rh = H
-                det_roi = crop_frame(frame, d_rx, d_ry, d_rw, d_rh)
-                inf_roi = det_roi
-                scale = 1.0
-                if det_roi.shape[1] > ROI_INFER_MAX_W:
-                    scale = ROI_INFER_MAX_W / float(det_roi.shape[1])
-                    new_w = int(det_roi.shape[1] * scale); new_h = int(det_roi.shape[0] * scale)
-                    inf_roi = cv2.resize(det_roi, (new_w, new_h))
-                car_dets = car_det.detect_frames([inf_roi], read_from_stub=False)[0]
-                if scale != 1.0:
-                    inv_sx = 1.0/scale; inv_sy = 1.0/scale
-                    for d in car_dets:
-                        d_scaled = scale_det(d, inv_sx, inv_sy)
-                        car_dets_full.append(offset_det(d_scaled, d_rx, d_ry))
-                else:
-                    for d in car_dets:
-                        car_dets_full.append(offset_det(d, d_rx, d_ry))
-
-            # Draw overlays
-            if DRAW_BBOXES and do_heavy_this_frame:
+            # Draw gate overlay
+            if use_gate:
+                draw_detection_band(frame, gate_x, W, H, GATE_DETECTION_BAND)
+                draw_gate_overlay(frame, gate_x, W, H, gate_right)
+            
+            if do_heavy_this_frame:
                 draw_lp_boxes(frame, lp_dets_full, color=(0,255,0))
-                if USE_CAR_DETECTOR:
-                    draw_lp_boxes(frame, car_dets_full, color=(255,200,0))
-            if DRAW_BBOXES:
-                if use_roi:
-                    draw_region(frame, rx, ry, rw, rh)
-                elif DRAW_GATE:
-                    gx = int(ENTRY_LINE_X_RATIO * W)
-                    cv2.line(frame, (gx, 0), (gx, H), (200, 200, 255), 2)
-                    cv2.putText(frame, "gate", (gx+6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,255), 2, cv2.LINE_AA)
 
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            gate_x = int(ENTRY_LINE_X_RATIO * W)
 
-            # Process detections (only when we actually ran them)
+            # Process detections (same logic as original)
             if do_heavy_this_frame:
                 for det, text in zip(lp_dets_full, lp_texts):
                     key = stable_key(text, det)
@@ -438,121 +422,99 @@ def main():
                     oid = idbank.get(key)
 
                     cx, cy = center_from_det(det)
-                    if use_roi:
-                        is_in = inside_region(cx, cy, rx, ry, rw, rh)
+                    if use_gate:
+                        is_in = (cx is not None) and ((cx >= gate_x) if gate_right else (cx <= gate_x))
                     else:
-                        if cx is None: is_in = False
-                        else:          is_in = (cx >= gate_x) if gate_right else (cx <= gate_x)
+                        is_in = False
 
-                    # init
+                    if PRINT_RAW_OCR_FOUND:
+                        norm = normalize_ocr_text(text or "")
+                        if norm and (re.search(u"[ぁ-ゖァ-ヿ]", norm) or plate_suffix(norm)):
+                            print(f"[RAW] text='{norm}'  center=({cx:.0f},{cy:.0f})  {'INSIDE' if is_in else 'OUTSIDE'}")
+
                     if oid not in prev_inside:
                         prev_inside[oid] = is_in
-                        inside_count[oid]  = 1 if is_in else 0
+                        inside_count[oid] = 1 if is_in else 0
                         outside_count[oid] = 0 if is_in else 1
                         if is_in:
                             capture_open[oid] = CAPTURE_WINDOW_FRAMES
                             best_score[oid] = 0.0; best_text[oid] = ""; best_det[oid] = det
-                            ocr_counts[oid] = {}  # init vote map
                         continue
 
-                    # streaks
                     if is_in:
-                        inside_count[oid]  = inside_count.get(oid,0) + 1
+                        inside_count[oid] = inside_count.get(oid,0) + 1
                         outside_count[oid] = 0
                     else:
                         outside_count[oid] = outside_count.get(oid,0) + 1
-                        inside_count[oid]  = 0
+                        inside_count[oid] = 0
 
-                    # skip anything already locked (-1)
                     if capture_open.get(oid, 0) == -1:
                         prev_inside[oid] = is_in
                         continue
 
-                    # Open capture window on gate cross or approach margin (Gate mode)
-                    if (not use_roi) and (not prev_inside[oid]) and is_in:
+                    # Open capture window on gate crossing
+                    if (not prev_inside[oid]) and is_in:
                         capture_open[oid] = CAPTURE_WINDOW_FRAMES
                         best_score[oid] = 0.0; best_text[oid] = ""; best_det[oid] = det
-                        ocr_counts[oid] = {}
 
-                    if (not use_roi) and (oid not in captured_in) and (capture_open.get(oid, 0) <= 0):
+                    # Open when approaching gate
+                    if (oid not in captured_in) and (capture_open.get(oid, 0) <= 0):
                         if cx is not None and abs(cx - gate_x) <= GATE_CAPTURE_MARGIN_PX:
                             approaching_from_outside = (cx < gate_x) if gate_right else (cx > gate_x)
                             if approaching_from_outside:
                                 capture_open[oid] = CAPTURE_WINDOW_FRAMES
                                 best_score[oid] = 0.0; best_text[oid] = ""; best_det[oid] = det
-                                ocr_counts[oid] = {}
 
-                    # one-shot capture maintenance
+                    # Capture best plate reading
                     if is_in and (oid not in captured_in):
-                        plate_img = None
                         if capture_open.get(oid, 0) > 0:
                             x1,y1,x2,y2 = map(int, xyxy_from_det(det))
                             plate_img = frame[max(0,y1):min(H,y2), max(0,x1):min(W,x2)]
 
-                            # NEW: skip tiny crops and very blurry ones to save OCR cycles
                             min_side = min(y2-y1, x2-x1)
-                            if min_side >= 18:
-                                sharp = variance_of_laplacian(plate_img)
-                                if sharp >= 25.0:
-                                    score = bbox_area(det) * max(1.0, sharp)
+                            if min_side < 18:
+                                capture_open[oid] -= 1
+                                continue
 
-                                    # temporal OCR voting (prefer most frequent valid string)
-                                    norm = normalize_ocr_text(text or "")
-                                    if norm:
-                                        dmap = ocr_counts.setdefault(oid, {})
-                                        dmap[norm] = dmap.get(norm, 0) + 1
-                                        if plate_suffix(norm):
-                                            cur_best = best_text.get(oid, "")
-                                            cur_cnt  = dmap.get(cur_best, 0)
-                                            if dmap[norm] >= cur_cnt:
-                                                best_text[oid] = norm
+                            sharp = variance_of_laplacian(plate_img)
+                            if sharp < 25.0:
+                                capture_open[oid] -= 1
+                                continue
 
-                                    # fallback by area*sharpness if current has a valid suffix
-                                    if score > best_score.get(oid, 0.0) and plate_suffix(text or ""):
-                                        best_score[oid] = score
-                                        best_det[oid]   = det
+                            score = bbox_area(det) * max(1.0, sharp)
 
-                                    # early accept if sharp enough & suffix present
-                                    if plate_suffix(text or "") and sharp >= MIN_SHARPNESS_LOCK:
-                                        capture_open[oid] = 0  # close the window now
-                                    else:
-                                        capture_open[oid] -= 1
-                                else:
-                                    # too blurry, keep window open (hope for better frame)
-                                    capture_open[oid] -= 1
+                            if score > best_score.get(oid, 0.0) and plate_suffix(text or ""):
+                                best_score[oid] = score
+                                best_text[oid] = text
+                                best_det[oid] = det
+
+                            if plate_suffix(text or "") and sharp >= MIN_SHARPNESS_LOCK:
+                                capture_open[oid] = 0
                             else:
-                                # too small, wait for a nearer/better frame
                                 capture_open[oid] -= 1
 
-                        # when window closes (by countdown or early accept), log IN once
+                        # Log ENTRY event
                         if capture_open.get(oid, 0) == 0 and inside_count[oid] >= ENTER_STABLE_FRAMES:
-                            # choose most frequent valid voted text if available, else fallback
-                            voted = ""
-                            dm = ocr_counts.get(oid, {})
-                            if dm:
-                                # prefer strings that have a valid suffix
-                                valids = [(t,c) for t,c in dm.items() if plate_suffix(t)]
-                                if valids:
-                                    voted = max(valids, key=lambda z: z[1])[0]
-                                else:
-                                    voted = max(dm.items(), key=lambda z: z[1])[0]
-                            chosen_text = voted or best_text.get(oid,"") or text or ""
+                            chosen_text = best_text.get(oid,"") or text or ""
                             pk = plate_key(chosen_text)
-                            region_class, suf, kana, city = parse_plate_fields(chosen_text)
+                            region_class, suf, kana, city, engine_size = parse_plate_fields(chosen_text)
 
-                            chosen_slot = None
+                            # Check for duplicate (same plate already inside)
                             if pk and pk in active_plate_to_slot:
                                 chosen_slot = active_plate_to_slot[pk]
                                 active_id_to_plate[oid] = pk
                                 active_id_to_slot[oid] = chosen_slot
                                 if suf: active_id_to_suffix[oid] = suf
                                 captured_in.add(oid); last_event_f[oid] = frame_idx; capture_open[oid] = -1
-                                if DRAW_BBOXES:
-                                    cv2.putText(frame, f"IN {chosen_slot:02d}(dup)", (int(cx), int(cy)),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,180,255), 2, cv2.LINE_AA)
+                                cv2.putText(frame, f"IN {chosen_slot:02d}(dup)", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,180,255), 2, cv2.LINE_AA)
+                                slot_str = f"{chosen_slot:02d}({suf})" if suf else f"{chosen_slot:02d}"
+                                log_terminal(ts, "in", slot_str, region_class, suf, kana, city, chosen_text)
                                 prev_inside[oid] = is_in
                                 continue
 
+                            # Check for duplicate by suffix
+                            chosen_slot = None
                             if suf and suf in active_suffix_to_slot:
                                 chosen_slot = active_suffix_to_slot[suf]
                                 if pk:
@@ -562,12 +524,14 @@ def main():
                                 active_id_to_slot[oid] = chosen_slot
                                 active_id_to_suffix[oid] = suf
                                 captured_in.add(oid); last_event_f[oid] = frame_idx; capture_open[oid] = -1
-                                if DRAW_BBOXES:
-                                    cv2.putText(frame, f"IN {chosen_slot:02d}(dup)", (int(cx), int(cy)),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,180,255), 2, cv2.LINE_AA)
+                                cv2.putText(frame, f"IN {chosen_slot:02d}(dup)", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,180,255), 2, cv2.LINE_AA)
+                                slot_str = f"{chosen_slot:02d}({suf})" if suf else f"{chosen_slot:02d}"
+                                log_terminal(ts, "in", slot_str, region_class, suf, kana, city, chosen_text)
                                 prev_inside[oid] = is_in
                                 continue
 
+                            # Assign new slot
                             if pk and pk in plate_pref_slot:
                                 got = slot_pool.try_acquire_specific(plate_pref_slot[pk])
                                 if got is not None: chosen_slot = got
@@ -586,13 +550,14 @@ def main():
                                     active_suffix_to_slot[suf] = chosen_slot
                                     active_id_to_suffix[oid] = suf
 
-                                object_id = f"{chosen_slot:02d}({suf})" if suf else f"{chosen_slot:02d}"
+                                object_id = f"{chosen_slot:02d}"
                                 write_row_flush(csv_writer, csv_file,
-                                                [ts, object_id, "car", "in", region_class or "", suf or "", kana or "", city or ""])
+                                                [ts, object_id, "car", "in", city or "", engine_size or "", kana or "", suf or ""])
                                 captured_in.add(oid); last_event_f[oid] = frame_idx; capture_open[oid] = -1
-                                if DRAW_BBOXES:
-                                    cv2.putText(frame, f"IN {object_id}", (int(cx), int(cy)),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2, cv2.LINE_AA)
+                                cv2.putText(frame, f"▶ IN {object_id}", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2, cv2.LINE_AA)
+                                log_terminal(ts, "in", f"{object_id}({suf})" if suf else object_id,
+                                             region_class, suf, kana, city, chosen_text)
 
                     # EXIT handling
                     if prev_inside[oid] and (not is_in) and outside_count[oid] >= EXIT_STABLE_FRAMES:
@@ -606,22 +571,23 @@ def main():
 
                             if slot_to_free is not None:
                                 chosen_text = best_text.get(oid,"") or text or ""
-                                region_class, suf_out, kana, city = parse_plate_fields(chosen_text)
-                                object_id = f"{slot_to_free:02d}({suf_out})" if suf_out else f"{slot_to_free:02d}"
+                                region_class, suf_out, kana, city, engine_size = parse_plate_fields(chosen_text)
+                                object_id = f"{slot_to_free:02d}"
                                 write_row_flush(csv_writer, csv_file,
-                                                [ts, object_id, "car", "out", region_class or "", suf_out or "", kana or "", city or ""])
+                                                [ts, object_id, "car", "out", city or "", engine_size or "", kana or "", suf_out or ""])
                                 slot_pool.release(slot_to_free)
                                 last_event_f[oid] = frame_idx
-                                if DRAW_BBOXES:
-                                    cv2.putText(frame, f"OUT {object_id}", (int(cx), int(cy)),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+                                cv2.putText(frame, f"◀ OUT {object_id}", (int(cx), int(cy)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+                                log_terminal(ts, "out", f"{object_id}({suf_out})" if suf_out else object_id,
+                                             region_class, suf_out, kana, city, chosen_text)
+
                                 if suf_out and active_suffix_to_slot.get(suf_out) == slot_to_free:
                                     active_suffix_to_slot.pop(suf_out, None)
 
-                            # clear per-id mappings/state
                             active_id_to_plate.pop(oid, None)
                             active_id_to_suffix.pop(oid, None)
-                            for dct in (capture_open, best_score, best_text, best_det, ocr_counts):
+                            for dct in (capture_open, best_score, best_text, best_det):
                                 dct.pop(oid, None)
                             if oid in captured_in: captured_in.remove(oid)
 
@@ -632,45 +598,27 @@ def main():
                 now = time.time()
                 if now - t0 >= 0.5:
                     fps_est = fcount / (now - t0); t0 = now; fcount = 0
-                tag = "" if do_heavy_this_frame else "  (throttle)"
-                cv2.putText(frame, f"FPS ~ {fps_est:.1f}{tag}", (10, 24),
+                tag = "" if do_heavy_this_frame else " (throttled)"
+                cv2.putText(frame, f"FPS: {fps_est:.1f}{tag}", (10, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-                mode = "ROI" if use_roi else "Gate"
-                side = "Right" if gate_right else "Left"
-                cv2.putText(frame, f"Mode:{mode} Inside:{side}  [m]mode [o]side", (10, 48),
+                mode = "GATE" if use_gate else "ROI"
+                side = "RIGHT" if gate_right else "LEFT"
+                cv2.putText(frame, f"Mode: {mode} | Inside: {side} of line", (10, 52),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,255,180), 2, cv2.LINE_AA)
-                cv2.putText(frame, f"Source:{source_name}", (10, 68),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,220,255), 2, cv2.LINE_AA)
+                cv2.putText(frame, "[m]Toggle mode  [o]Flip side  [ESC]Quit", (10, 76),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180,180,255), 1, cv2.LINE_AA)
 
-            cv2.imshow("Parking (camera profile)", frame)
-            if out is not None and WRITE_VIDEO:
-                out.write(frame)
+            cv2.imshow("Gate-Based Parking Tracker", frame)
+            if out is not None and WRITE_VIDEO: out.write(frame)
 
-            # keyboard
+            # Keyboard controls
             k = cv2.waitKey(1) & 0xFF
-            if k == 27: break
+            if k == 27: break  # ESC
             if k == ord('m'):
-                use_roi = not use_roi
-                if use_roi:
-                    rx = int(REGION_XYWH_RATIO[0]*W); ry = int(REGION_XYWH_RATIO[1]*H)
-                    rw = int(REGION_XYWH_RATIO[2]*W); rh = int(REGION_XYWH_RATIO[3]*H)
-                    rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
-                else:
-                    rx, ry, rw, rh = 0, 0, W, H
+                use_gate = not use_gate
             if k == ord('o'):
                 gate_right = not gate_right
-            if use_roi and (not LOCK_ROI):
-                step = 12
-                if k == ord('w'): ry -= step
-                elif k == ord('s'): ry += step
-                elif k == ord('a'): rx -= step
-                elif k == ord('d'): rx += step
-                elif k == ord('['): rx += step; ry += step; rw -= 2*step; rh -= 2*step
-                elif k == ord(']'): rx -= step; ry -= step; rw += 2*step; rh += 2*step
-                elif k == ord('r'):
-                    rx = int(REGION_XYWH_RATIO[0]*W); ry = int(REGION_XYWH_RATIO[1]*H)
-                    rw = int(REGION_XYWH_RATIO[2]*W); rh = int(REGION_XYWH_RATIO[3]*H)
-                rx, ry, rw, rh = clamp_region(rx, ry, rw, rh, W, H)
+                print(f"[INFO] Inside zone now: {'RIGHT' if gate_right else 'LEFT'} of gate")
 
     finally:
         try: cap.release()
@@ -680,8 +628,9 @@ def main():
         except: pass
         cv2.destroyAllWindows()
         csv_file.close()
-        print("[INFO] CSV saved to", csv_path)
-        if WRITE_VIDEO: print("[INFO] Video saved to output_videos/output_video.avi")
+        print(f"\n[INFO] Session complete!")
+        print(f"[INFO] CSV log saved to: {csv_path}")
+        if WRITE_VIDEO: print("[INFO] Video saved to: output_videos/output_video.avi")
 
 if __name__ == "__main__":
     main()

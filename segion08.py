@@ -10,9 +10,9 @@ from datetime import datetime
 from detections import CarDetection, LicencePlateDetection
 
 # ===================== User settings =====================
-USE_CAMERA               = True
-USE_FILE                 = False
-INPUT_VIDEO_PATH         = "input_videos/Trim20.mp4"
+USE_CAMERA               = False
+USE_FILE                 = True
+INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
 
 # YouTube source (VOD or livestream). If enabled, overrides camera/file.
 USE_YOUTUBE              = False
@@ -33,7 +33,7 @@ USE_ROI                  = False
 ENTRY_LINE_X_RATIO       = 0.55   # vertical line as fraction of width
 GATE_CAPTURE_MARGIN_PX   = 60     # start capture window when within this many px of gate
 DRAW_GATE                = True
-GATE_INSIDE_IS_RIGHT     = True   # True: right of line means "inside"; False: left is inside
+GATE_INSIDE_IS_RIGHT     = False   # True: right of line means "inside"; False: left is inside
 
 # Stability & gaps
 ENTER_STABLE_FRAMES      = 1     # we lock early anyway
@@ -54,7 +54,7 @@ MIN_SHARPNESS_LOCK       = 60.0   # Laplacian variance to accept immediately
 
 # Performance toggles
 USE_CAR_DETECTOR         = False  # more load if True
-WRITE_VIDEO              = False
+WRITE_VIDEO              = True
 DRAW_BBOXES              = True
 SHOW_FPS                 = True
 TARGET_WIDTH             = 640    # small input for speed
