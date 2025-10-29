@@ -33,9 +33,12 @@ cenv/
 *.tar
 *.tar.gz
 *.mp4
+*.avi
 *.mov
 runs/
 outputs/
 checkpoints/
 datasets/
 models/
+.mpl_cache/
+logs/

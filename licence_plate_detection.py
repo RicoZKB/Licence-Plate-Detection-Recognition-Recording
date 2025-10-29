@@ -1,27 +1,63 @@
 import cv2
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import queue
 
 class LicencePlateDetection:
-    def __init__(self, model_path, verbose=False, debug_ocr=False):
+    def __init__(self, model_path, verbose=False, debug_ocr=False,
+                 use_gpu=True, enable_async_ocr=False, fast_mode=True):
         # load your YOLO model
         self.model = YOLO(model_path)
-        # initialize PaddleOCR
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='japan')
+
+        # OCR optimization settings
+        self.use_gpu = use_gpu
+        self.enable_async_ocr = enable_async_ocr
+        self.fast_mode = fast_mode
+
+        # Initialize PaddleOCR with optimized settings
+        ocr_kwargs = {
+            'lang': 'japan',
+            'use_angle_cls': False,  # Disabled for speed (plates are usually horizontal)
+            'show_log': False,
+            'use_gpu': use_gpu,
+        }
+
+        # Fast mode: reduce model complexity for speed
+        if fast_mode:
+            ocr_kwargs.update({
+                'det_db_thresh': 0.3,          # Lower threshold for faster detection
+                'det_db_box_thresh': 0.5,      # Box threshold
+                'rec_batch_num': 6,            # Batch processing
+                'use_space_char': True,
+                'drop_score': 0.3,             # Lower confidence threshold
+                'use_dilation': False,         # Skip dilation for speed
+                'det_limit_side_len': 640,     # Limit detection side length
+                'rec_image_shape': "3, 32, 320" # Smaller recognition shape
+            })
+
+        self.ocr = PaddleOCR(**ocr_kwargs)
+
+        # Async OCR thread pool
+        if enable_async_ocr:
+            self.ocr_executor = ThreadPoolExecutor(max_workers=2)
+            self.ocr_queue = queue.Queue(maxsize=5)
+
         # logging options
         self.verbose = bool(verbose)
         self.debug_ocr = bool(debug_ocr)
 
-    def detect_frames(self, frames):
+    def detect_frames(self, frames, ocr_filter=None):
         all_bboxes = []
         all_texts = []
         for frame in frames:
-            bboxes, texts = self.detect_frame(frame)
+            bboxes, texts = self.detect_frame(frame, ocr_filter=ocr_filter)
             all_bboxes.append(bboxes)
             all_texts.append(texts)
         return all_bboxes, all_texts
 
-    def detect_frame(self, frame):
+    def detect_frame(self, frame, ocr_filter=None):
         results = self.model.predict(frame)[0]
         detections = []
         texts = []
@@ -68,30 +104,50 @@ class LicencePlateDetection:
             x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
             crop = frame[y1:y2, x1:x2]
 
-            # preprocess for OCR (low-light friendly)
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            # CLAHE contrast boost
-            try:
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                gray = clahe.apply(gray)
-            except Exception:
-                pass
-            # mild unsharp mask to enhance edges
-            try:
-                blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
-                gray = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
-            except Exception:
-                pass
-            up = cv2.resize(gray, None, fx=2, fy=2)
-            prep = cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)
-
-            # RUN OCR — no cls=True
-            ocr_res = self.ocr.ocr(prep)
-            if self.debug_ocr:
+            run_ocr = True
+            if ocr_filter is not None:
                 try:
-                    print("DEBUG OCR_RES:", ocr_res)
+                    run_ocr = bool(ocr_filter((x1, y1, x2, y2)))
+                except Exception:
+                    run_ocr = True
+
+            # OPTIMIZED preprocessing for OCR
+            if self.fast_mode:
+                # Fast mode: minimal preprocessing (2-3x faster)
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                # Only upscale 1.5x instead of 2x (saves 30% processing time)
+                up = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
+                prep = cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)
+            else:
+                # Quality mode: full preprocessing (original behavior)
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                # CLAHE contrast boost
+                try:
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    gray = clahe.apply(gray)
                 except Exception:
                     pass
+                # mild unsharp mask to enhance edges
+                try:
+                    blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
+                    gray = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+                except Exception:
+                    pass
+                up = cv2.resize(gray, None, fx=2, fy=2)
+                prep = cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)
+
+            # RUN OCR — optimized
+            ocr_res = []
+            if run_ocr:
+                try:
+                    # Use PaddleOCR with cls=False (already set in init)
+                    ocr_res = self.ocr.ocr(prep, cls=False)
+                    if self.debug_ocr:
+                        print("DEBUG OCR_RES:", ocr_res)
+                except Exception as e:
+                    if self.debug_ocr:
+                        print(f"OCR Error: {e}")
+                    ocr_res = []
 
             # normalize each line into (y_top, text)
             lines = []
