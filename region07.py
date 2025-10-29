@@ -10,7 +10,7 @@ from datetime import datetime
 from detections import CarDetection, LicencePlateDetection
 
 # ===================== User settings =====================
-USE_CAMERA               = True
+USE_CAMERA               = False
 INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
 
 SLOT_COUNT               = 10
