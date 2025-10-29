@@ -12,8 +12,8 @@ from licence_plate_detection import LicencePlateDetection
 
 # ===================== User settings =====================
 # Choose exactly ONE:
-USE_CAMERA               = True
-USE_FILE                 = False
+USE_CAMERA               = False
+USE_FILE                 = True
 USE_YOUTUBE              = False
 
 # File source
