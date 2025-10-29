@@ -8,8 +8,8 @@ from licence_plate_detection import LicencePlateDetection
 
 # ===================== GATE MODE SETTINGS =====================
 # Source selection (choose exactly one)
-USE_CAMERA               = True
-USE_FILE                 = False
+USE_CAMERA               = False
+USE_FILE                 = True
 USE_YOUTUBE              = False
 
 INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
