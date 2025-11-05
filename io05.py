@@ -24,16 +24,8 @@ INPUT_VIDEO_PATH         = "input_videos/Trim03.mp4"
 YOUTUBE_URL              = "https://www.youtube.com/watch?v=jqtsC5BYlIk"
 YOUTUBE_MAX_HEIGHT       = 480   # progressive MP4 at or below this height
 
-# Directional mode: "IN_ONLY", "OUT_ONLY", "BIDIRECTIONAL"
-DIRECTION_MODE           = "BIDIRECTIONAL"  # <-- Choose IN_ONLY, OUT_ONLY, or BIDIRECTIONAL
-
-# Bidirectional configuration (only used when DIRECTION_MODE = "BIDIRECTIONAL")
-# Camera views TWO SEPARATE LANES side-by-side (like dashcam view)
-# Each lane has its own fixed direction - they are physically divided
-LANE_DIVIDER_X_RATIO     = 0.50   # Vertical line dividing left/right lanes (0.5 = center)
-LEFT_LANE_DIRECTION      = "out"  # Direction for left lane: "in" or "out"
-RIGHT_LANE_DIRECTION     = "in"   # Direction for right lane: "in" or "out"
-                                   # Example: left="out" (exit), right="in" (entry)
+# Directional mode: "IN_ONLY", "OUT_ONLY" (single direction processing)
+DIRECTION_MODE           = "IN_ONLY"  # <-- Choose IN_ONLY or OUT_ONLY for single-direction tracking
 
 # Terminal logging toggles
 PRINT_EVENTS_TO_TERMINAL = True   # <-- print every IN/OUT nicely to terminal
@@ -625,46 +617,17 @@ def draw_track_history_overlay(frame, histories, inside_flags):
         # emphasize most recent point
         cv2.circle(frame, pts_int[-1], TRACK_POINT_RADIUS+1, color, -1)
 
-# ---------- Lane-based direction detection (for bidirectional mode) ----------
-def determine_lane_direction(cx, lane_divider_x, left_direction="out", right_direction="in"):
-    """
-    Determine vehicle direction based on which lane (left/right) it's in.
-    For side-by-side lane setups where each lane has a fixed direction.
-
-    Args:
-        cx: Center X coordinate of the vehicle
-        lane_divider_x: X coordinate dividing left and right lanes
-        left_direction: Direction for left lane ("in" or "out")
-        right_direction: Direction for right lane ("in" or "out")
-
-    Returns:
-        tuple: (lane, direction) where:
-               lane is "left" or "right"
-               direction is "in" or "out"
-    """
-    if cx is None:
-        return None, None
-
-    # Determine which lane the vehicle is in
-    if cx < lane_divider_x:
-        return "left", left_direction
-    else:
-        return "right", right_direction
-
 # ---------- main ----------
 def main():
     # --- Validate direction mode ---
-    if DIRECTION_MODE not in ["IN_ONLY", "OUT_ONLY", "BIDIRECTIONAL"]:
-        raise RuntimeError("DIRECTION_MODE must be 'IN_ONLY', 'OUT_ONLY', or 'BIDIRECTIONAL'")
+    if DIRECTION_MODE not in ["IN_ONLY", "OUT_ONLY"]:
+        raise RuntimeError("DIRECTION_MODE must be either 'IN_ONLY' or 'OUT_ONLY'")
 
     print(f"[INFO] Direction mode: {DIRECTION_MODE}")
     if DIRECTION_MODE == "IN_ONLY":
         print("[INFO] Only IN events will be tracked and logged")
-    elif DIRECTION_MODE == "OUT_ONLY":
-        print("[INFO] Only OUT events will be tracked and logged")
     else:
-        print("[INFO] BIDIRECTIONAL mode: tracking both IN and OUT events")
-        print(f"[INFO] Left lane = {LEFT_LANE_DIRECTION.upper()}, Right lane = {RIGHT_LANE_DIRECTION.upper()}")
+        print("[INFO] Only OUT events will be tracked and logged")
 
     # --- Source selection (exactly one) ---
     chosen = [name for name, val in [("Camera", USE_CAMERA), ("YouTube", USE_YOUTUBE), ("File", USE_FILE)] if val]
@@ -746,10 +709,6 @@ def main():
     last_seen_frame = {}
     latest_det = {}
     pending_in_cross = set()
-
-    # Bidirectional tracking: lane assignment per object
-    vehicle_lane = {}  # oid -> "left" or "right"
-    vehicle_direction = {}  # oid -> "in" or "out"
 
     # one-shot bookkeeping
     capture_open = {}    # oid -> frames left (0 close, -1 locked)
@@ -862,29 +821,10 @@ def main():
             if DRAW_BBOXES:
                 if use_roi:
                     draw_region(frame, rx, ry, rw, rh)
-                elif DIRECTION_MODE == "BIDIRECTIONAL":
-                    # Draw lane divider for side-by-side lanes
-                    lane_x = int(LANE_DIVIDER_X_RATIO * W)
-                    cv2.line(frame, (lane_x, 0), (lane_x, H), (255, 255, 0), 3)
-
-                    # Label each lane with its direction
-                    left_label = LEFT_LANE_DIRECTION.upper()
-                    right_label = RIGHT_LANE_DIRECTION.upper()
-                    left_color = (0, 255, 0) if LEFT_LANE_DIRECTION == "in" else (0, 0, 255)
-                    right_color = (0, 255, 0) if RIGHT_LANE_DIRECTION == "in" else (0, 0, 255)
-
-                    # Left lane label
-                    cv2.putText(frame, f"LEFT: {left_label}", (lane_x - 150, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, left_color, 2, cv2.LINE_AA)
-                    # Right lane label
-                    cv2.putText(frame, f"RIGHT: {right_label}", (lane_x + 20, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, right_color, 2, cv2.LINE_AA)
                 elif DRAW_GATE:
-                    # Single direction mode - draw simple gate line
                     gx = int(ENTRY_LINE_X_RATIO * W)
                     cv2.line(frame, (gx, 0), (gx, H), (200, 200, 255), 2)
                     cv2.putText(frame, "gate", (gx+6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,255), 2, cv2.LINE_AA)
-
             if DRAW_TRACK_HISTORY:
                 draw_track_history_overlay(frame, track_history, prev_inside)
 
@@ -909,19 +849,6 @@ def main():
                         is_in = inside_region(cx, cy, rx, ry, rw, rh)
                     else:
                         is_in = (cx is not None) and ((cx >= gate_x) if gate_right else (cx <= gate_x))
-
-                    # Determine lane and direction for bidirectional mode
-                    if DIRECTION_MODE == "BIDIRECTIONAL" and cx is not None:
-                        lane_divider_x = int(LANE_DIVIDER_X_RATIO * W)
-                        lane, direction = determine_lane_direction(
-                            cx,
-                            lane_divider_x,
-                            LEFT_LANE_DIRECTION,
-                            RIGHT_LANE_DIRECTION
-                        )
-                        if lane and direction:
-                            vehicle_lane[oid] = lane
-                            vehicle_direction[oid] = direction
 
                     if oid not in track_history:
                         track_history[oid] = deque(maxlen=TRACK_HISTORY_LEN)
@@ -1031,13 +958,8 @@ def main():
                             pk = plate_key(chosen_text)
                             region_class, suf, kana, city, engine_size = parse_plate_fields(chosen_text)
 
-                            # Determine event direction based on mode
-                            if DIRECTION_MODE == "BIDIRECTIONAL":
-                                # Use the lane-based direction
-                                event_direction = vehicle_direction.get(oid, "in")
-                            else:
-                                # Use direction from settings
-                                event_direction = "in" if DIRECTION_MODE == "IN_ONLY" else "out"
+                            # Use direction from settings
+                            event_direction = "in" if DIRECTION_MODE == "IN_ONLY" else "out"
 
                             # ---- duplicate attach: plate already has a slot ----
                             if pk and pk in active_plate_to_slot:
@@ -1050,15 +972,9 @@ def main():
                                 if DRAW_BBOXES:
                                     cx_i, cy_i = center_from_det(det)
                                     if cx_i is not None and cy_i is not None:
-                                        label = event_direction.upper()
+                                        label = "IN" if DIRECTION_MODE == "IN_ONLY" else "OUT"
                                         color = (0,180,255)
-                                        # Add lane info for bidirectional mode
-                                        if DIRECTION_MODE == "BIDIRECTIONAL":
-                                            lane = vehicle_lane.get(oid, "?")
-                                            display_label = f"{label} {chosen_slot:02d}(dup) [{lane.upper()}]"
-                                        else:
-                                            display_label = f"{label} {chosen_slot:02d}(dup)"
-                                        cv2.putText(frame, display_label, (int(cx_i), int(cy_i)),
+                                        cv2.putText(frame, f"{label} {chosen_slot:02d}(dup)", (int(cx_i), int(cy_i)),
                                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
                                 # terminal log (dup attach)
                                 slot_str = f"{chosen_slot:02d}({suf})" if suf else f"{chosen_slot:02d}"
@@ -1081,15 +997,9 @@ def main():
                                 if DRAW_BBOXES:
                                     cx_i, cy_i = center_from_det(det)
                                     if cx_i is not None and cy_i is not None:
-                                        label = event_direction.upper()
+                                        label = "IN" if DIRECTION_MODE == "IN_ONLY" else "OUT"
                                         color = (0,180,255)
-                                        # Add lane info for bidirectional mode
-                                        if DIRECTION_MODE == "BIDIRECTIONAL":
-                                            lane = vehicle_lane.get(oid, "?")
-                                            display_label = f"{label} {chosen_slot:02d}(dup) [{lane.upper()}]"
-                                        else:
-                                            display_label = f"{label} {chosen_slot:02d}(dup)"
-                                        cv2.putText(frame, display_label, (int(cx_i), int(cy_i)),
+                                        cv2.putText(frame, f"{label} {chosen_slot:02d}(dup)", (int(cx_i), int(cy_i)),
                                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
                                 slot_str = f"{chosen_slot:02d}({suf})" if suf else f"{chosen_slot:02d}"
                                 log_terminal(ts, event_direction, slot_str, region_class, suf, kana, city, chosen_text)
@@ -1119,8 +1029,8 @@ def main():
                                 object_id = f"{chosen_slot:02d}"
                                 write_row_flush(csv_writer, csv_file,
                                                 [ts, object_id, "car", event_direction, city or "", engine_size or "", kana or "", suf or ""])
-                                # Update parking analytics based on actual direction
-                                if event_direction == "in":
+                                # Update parking analytics based on direction
+                                if DIRECTION_MODE == "IN_ONLY":
                                     parking_stats.vehicle_entered(object_id, ts)
                                 else:
                                     parking_stats.vehicle_exited(object_id, ts)
@@ -1129,16 +1039,9 @@ def main():
                                 if DRAW_BBOXES:
                                     cx_i, cy_i = center_from_det(det)
                                     if cx_i is not None and cy_i is not None:
-                                        label = event_direction.upper()
-                                        # Green for entry, Red for exit
-                                        color = (0,255,0) if event_direction == "in" else (0,0,255)
-                                        # Add lane info for bidirectional mode
-                                        if DIRECTION_MODE == "BIDIRECTIONAL":
-                                            lane = vehicle_lane.get(oid, "?")
-                                            display_label = f"{label} {object_id} [{lane.upper()}]"
-                                        else:
-                                            display_label = f"{label} {object_id}"
-                                        cv2.putText(frame, display_label, (int(cx_i), int(cy_i)),
+                                        label = "IN" if DIRECTION_MODE == "IN_ONLY" else "OUT"
+                                        color = (0,255,0) if DIRECTION_MODE == "IN_ONLY" else (0,0,255)
+                                        cv2.putText(frame, f"{label} {object_id}", (int(cx_i), int(cy_i)),
                                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
                                 # terminal log
                                 log_terminal(ts, event_direction, f"{object_id}({suf})" if suf else object_id,
@@ -1155,9 +1058,6 @@ def main():
                     last_seen_frame.pop(stale_oid, None)
                     # Remove from OCR cache
                     ocr_cache.remove(stale_oid)
-                    # Remove bidirectional tracking data
-                    vehicle_lane.pop(stale_oid, None)
-                    vehicle_direction.pop(stale_oid, None)
 
                 # Cleanup stale OCR cache entries
                 ocr_cache.cleanup_stale(frame_idx)
@@ -1171,14 +1071,9 @@ def main():
                 cv2.putText(frame, f"FPS ~ {fps_est:.1f}{tag}", (10, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
                 mode = "ROI" if use_roi else "Gate"
-                if DIRECTION_MODE == "BIDIRECTIONAL":
-                    flow_config = f"L:{LEFT_LANE_DIRECTION.upper()} R:{RIGHT_LANE_DIRECTION.upper()}"
-                    cv2.putText(frame, f"Mode:{mode} Dir:{DIRECTION_MODE} ({flow_config})  [m]mode", (10, 48),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,255,180), 2, cv2.LINE_AA)
-                else:
-                    side = "Right" if gate_right else "Left"
-                    cv2.putText(frame, f"Mode:{mode} Inside:{side} Dir:{DIRECTION_MODE}  [m]mode [o]side", (10, 48),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,255,180), 2, cv2.LINE_AA)
+                side = "Right" if gate_right else "Left"
+                cv2.putText(frame, f"Mode:{mode} Inside:{side} Dir:{DIRECTION_MODE}  [m]mode [o]side", (10, 48),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180,255,180), 2, cv2.LINE_AA)
 
             # Parking stats overlay
             if ENABLE_CAPACITY_TRACKING or ENABLE_ANALYTICS:
